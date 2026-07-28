@@ -1,6 +1,9 @@
 """High-bar Telegram alerts — ENTRY and EXIT.
 
-ENTRY: news + strong conviction + executable action + optional technicals.
+ENTRY is decided by Saint's board only (action + conviction + fresh news + thesis).
+Technicals and AI are optional commentary on the Telegram text — they never
+gate whether the notification fires (unless SAINT_ALERTS_REQUIRE_TECHNICALS=true).
+
 EXIT: after we alerted an entry for the symbol today, when thesis fades
 (giveback / trailing stop / reverse / invalidated) → push exit/watch.
 
@@ -235,7 +238,66 @@ def _entry_skip_reason(row: dict) -> str | None:
     return None
 
 
-def _format_entry(row: dict, *, tech_note: str | None) -> str:
+def _ai_comment_for_row(row: dict) -> str | None:
+    """Best-effort AI blurb. Failures return None — never blocks ENTRY."""
+    if not settings.alerts_ai_comment:
+        return None
+    try:
+        from .ai_helper import ai_configured, run_ai_helper
+
+        if not ai_configured():
+            return None
+        sym = str(row.get("symbol") or "").upper()
+        if not sym:
+            return None
+        # Prefer full stock packet when cheap; fall back to board row.
+        stock = row
+        news: list[dict] = []
+        context: list[dict] = []
+        try:
+            from .service import build_stock_detail
+
+            detail = build_stock_detail(sym)
+            if detail and detail.get("stock"):
+                stock = detail["stock"]
+                news = detail.get("news") or []
+                context = detail.get("context") or []
+        except Exception:  # noqa: BLE001
+            pass
+
+        result = run_ai_helper(stock, news, context, force=False)
+        if not result.get("ready"):
+            return None
+        parts: list[str] = []
+        verdict = result.get("verdict")
+        timing = result.get("timing")
+        conf = result.get("confidence")
+        if verdict:
+            bits = [str(verdict)]
+            if timing:
+                bits.append(str(timing))
+            if conf:
+                bits.append(f"conf {conf}")
+            parts.append(" · ".join(bits))
+        if result.get("headline"):
+            parts.append(str(result["headline"])[:200])
+        if result.get("setup"):
+            parts.append(f"Setup: {str(result['setup'])[:190]}")
+        for b in (result.get("bullets") or [])[:2]:
+            parts.append(f"• {str(b)[:190]}")
+        text = "\n".join(parts).strip()
+        return text[:700] if text else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _format_entry(
+    row: dict,
+    *,
+    tech_note: str | None,
+    tech_aligned: bool | None = None,
+    ai_comment: str | None = None,
+) -> str:
     sym = row.get("symbol") or "?"
     name = row.get("name") or sym
     action = row.get("action") or "watch"
@@ -253,7 +315,13 @@ def _format_entry(row: dict, *, tech_note: str | None) -> str:
         f"Thesis: {thesis}",
     ]
     if tech_note:
-        lines.append(f"Technicals: {tech_note}")
+        if tech_aligned is False:
+            lines.append(f"Technicals (soft): {tech_note}")
+        else:
+            lines.append(f"Technicals: {tech_note}")
+    if ai_comment:
+        lines.append("AI comment:")
+        lines.append(ai_comment)
     if note:
         lines.append(f"Note: {note}")
     if headline:
@@ -307,11 +375,17 @@ def evaluate_entries(stocks: list[dict], *, session_day: str) -> list[dict]:
         if skip:
             continue
         action = (row.get("action") or "").strip().lower()
+        tech_aligned: bool | None = None
         tech_note = None
-        if settings.alerts_require_technicals:
+        try:
             ok, tech_note = _tech_aligns(str(row.get("symbol") or ""), action)
-            if not ok:
-                continue
+            tech_aligned = bool(ok)
+        except Exception:  # noqa: BLE001
+            tech_note = "tech_check_failed"
+            tech_aligned = None
+        # Optional hard gate (off by default). Soft path always keeps going.
+        if settings.alerts_require_technicals and tech_aligned is False:
+            continue
         key = _entry_dedupe_key(row, session_day)
         if _already_sent(key):
             continue
@@ -319,6 +393,7 @@ def evaluate_entries(stocks: list[dict], *, session_day: str) -> list[dict]:
         if _get_open_entry(session_day, str(row.get("symbol") or "")):
             continue
         side = "long" if action in _BUY_LONG else "short"
+        ai_comment = _ai_comment_for_row(row)
         out.append(
             {
                 "kind": "entry",
@@ -328,7 +403,14 @@ def evaluate_entries(stocks: list[dict], *, session_day: str) -> list[dict]:
                 "action": row.get("action"),
                 "conviction": row.get("conviction"),
                 "techNote": tech_note,
-                "text": _format_entry(row, tech_note=tech_note),
+                "techAligned": tech_aligned,
+                "aiComment": bool(ai_comment),
+                "text": _format_entry(
+                    row,
+                    tech_note=tech_note,
+                    tech_aligned=tech_aligned,
+                    ai_comment=ai_comment,
+                ),
                 "row": {
                     "symbol": row.get("symbol"),
                     "action": row.get("action"),

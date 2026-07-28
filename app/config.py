@@ -61,7 +61,10 @@ class Settings(BaseSettings):
     alerts_secret: str = ""
     alerts_min_conviction: int = 60
     alerts_max_news_age_mins: int = 360
-    alerts_require_technicals: bool = True
+    # Hard technical gate is off by default — Saint board decides; tech/AI are commentary.
+    alerts_require_technicals: bool = False
+    # Best-effort Gemini/OpenAI blurb on ENTRY; never blocks the Telegram send.
+    alerts_ai_comment: bool = True
     alerts_db: Path = Path(__file__).resolve().parent.parent / "data" / "alerts.sqlite3"
 
 
