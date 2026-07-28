@@ -87,8 +87,7 @@ def prices(symbol: str, range: str = Query("1M", alias="range")):
     return build_prices(symbol, range_key=range)
 
 
-@app.get("/api/alerts/tick")
-@app.post("/api/alerts/tick")
+@app.api_route("/api/alerts/tick", methods=["GET", "POST", "HEAD"])
 def alerts_tick(
     force: bool = Query(False),
     key: str | None = Query(None),
@@ -97,6 +96,7 @@ def alerts_tick(
     """Scan board and push high-bar Telegram alerts.
 
     Point UptimeRobot (every 5–10 min) at this URL during market hours.
+    HEAD is supported so free UptimeRobot probes still run the scan.
     """
     _check_alerts_secret(key, x_saint_alerts_key)
     return run_alert_tick(force_dashboard=force)
