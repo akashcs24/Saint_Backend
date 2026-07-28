@@ -32,7 +32,7 @@ def _check_alerts_secret(
         raise HTTPException(status_code=401, detail="Invalid alerts key")
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {
         "ok": True,
