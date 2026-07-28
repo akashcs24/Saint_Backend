@@ -824,28 +824,84 @@ def build_dashboard() -> dict:
     }
 
 
-_DASH_CACHE: dict = {"ts": 0.0, "payload": None}
+_DASH_CACHE: dict = {"ts": 0.0, "payload": None, "building": False}
+_DASH_LOCK = __import__("threading").Lock()
+
+
+def _store_dashboard(payload: dict) -> dict:
+    payload = dict(payload)
+    payload["cached"] = False
+    payload["stale"] = False
+    _DASH_CACHE["ts"] = time.time()
+    _DASH_CACHE["payload"] = payload
+    return payload
+
+
+def _rebuild_dashboard_bg(*, force: bool = False) -> None:
+    """Background refresh — never blocks the request that served stale data."""
+    with _DASH_LOCK:
+        if _DASH_CACHE["building"]:
+            return
+        _DASH_CACHE["building"] = True
+    try:
+        payload = build_dashboard()
+        _store_dashboard(payload)
+    except Exception:  # noqa: BLE001
+        # Keep last good cache; next request can retry.
+        pass
+    finally:
+        with _DASH_LOCK:
+            _DASH_CACHE["building"] = False
 
 
 def get_dashboard(*, force: bool = False) -> dict:
-    """Cached dashboard — avoids 30–60s rebuilds on every back-nav."""
+    """Serve last board instantly when possible; refresh Yahoo/news in background.
+
+    Free hosting + Yahoo make a full rebuild 30–120s. Stale-while-revalidate
+    keeps the phone UI fast after the first successful build.
+    """
     from .session import is_open_window
 
     now = time.time()
     ttl = float(settings.dashboard_ttl_open_s if is_open_window() else settings.dashboard_ttl_s)
-    if (
-        not force
-        and _DASH_CACHE["payload"] is not None
-        and now - float(_DASH_CACHE["ts"]) < ttl
-    ):
-        cached = dict(_DASH_CACHE["payload"])
-        cached["cached"] = True
-        return cached
-    payload = build_dashboard()
-    payload["cached"] = False
-    _DASH_CACHE["ts"] = now
-    _DASH_CACHE["payload"] = payload
-    return payload
+    cached = _DASH_CACHE["payload"]
+    age = now - float(_DASH_CACHE["ts"]) if cached is not None else None
+
+    if cached is not None:
+        out = dict(cached)
+        out["cached"] = True
+        out["cacheAgeS"] = round(float(age or 0), 1)
+        stale = bool(age is not None and age >= ttl)
+        out["stale"] = stale or force
+        # Soft path: always return cache; refresh when stale or force.
+        if force or stale:
+            t = __import__("threading").Thread(
+                target=_rebuild_dashboard_bg,
+                kwargs={"force": force},
+                daemon=True,
+                name="saint-dash-rebuild",
+            )
+            t.start()
+        return out
+
+    # Cold start — nothing to serve yet; must build synchronously once.
+    with _DASH_LOCK:
+        # Another request may have started building.
+        if _DASH_CACHE["building"] and _DASH_CACHE["payload"] is None:
+            pass
+        _DASH_CACHE["building"] = True
+    try:
+        # Re-check: background may have finished.
+        if _DASH_CACHE["payload"] is not None and not force:
+            out = dict(_DASH_CACHE["payload"])
+            out["cached"] = True
+            out["stale"] = False
+            return out
+        payload = build_dashboard()
+        return _store_dashboard(payload)
+    finally:
+        with _DASH_LOCK:
+            _DASH_CACHE["building"] = False
 
 
 def build_stock_detail(symbol: str) -> dict | None:

@@ -20,6 +20,9 @@ _FLAT_PCT = 0.05
 # Weight-weighted contribution thresholds for a directional lean.
 _LEAN_PCT = 0.12
 _WEIGHT_TREND_EPS = 1.0  # percentage points of decline-weight
+_BREADTH_CACHE: dict = {"ts": 0.0, "payload": None}
+_BREADTH_TTL_S = 90.0  # reuse breadth board across dashboard rebuilds
+
 
 def _side(change_pct: float) -> str:
     if change_pct > _FLAT_PCT:
@@ -29,8 +32,20 @@ def _side(change_pct: float) -> str:
     return "flat"
 
 
-def build_nifty_breadth(*, max_workers: int = 12) -> dict:
+def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
     """Advance/decline + weight-weighted Nifty lean from constituent quotes."""
+    import time
+
+    now = time.time()
+    if (
+        not force
+        and _BREADTH_CACHE["payload"] is not None
+        and now - float(_BREADTH_CACHE["ts"]) < _BREADTH_TTL_S
+    ):
+        out = dict(_BREADTH_CACHE["payload"])
+        out["cached"] = True
+        return out
+
     weight_pack = get_nifty_weights()
     nifty_weights: dict[str, float] = weight_pack.get("weights") or {}
     symbols = [s for s in nifty_weights if s in UNIVERSE]
@@ -184,7 +199,7 @@ def build_nifty_breadth(*, max_workers: int = 12) -> dict:
         "up": trend_pair("nifty_weight_up", current=w_up_r, eps=_WEIGHT_TREND_EPS),
     }
 
-    return {
+    result = {
         "ready": True,
         "advances": advances,
         "declines": declines,
@@ -204,4 +219,8 @@ def build_nifty_breadth(*, max_workers: int = 12) -> dict:
         "pcr": pcr,
         "weightsMeta": weights_meta,
         "weightTrend": weight_trend,
+        "cached": False,
     }
+    _BREADTH_CACHE["ts"] = time.time()
+    _BREADTH_CACHE["payload"] = result
+    return result

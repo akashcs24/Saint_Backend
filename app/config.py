@@ -29,9 +29,10 @@ class Settings(BaseSettings):
     intraday_ttl_s: int = 900
     # Near cash open, force a Yahoo 15m re-pull more often
     intraday_ttl_open_s: int = 60
-    # Dashboard response cache (seconds) — back-nav / refresh reuse
-    dashboard_ttl_s: int = 45
-    dashboard_ttl_open_s: int = 25
+    # Dashboard response cache — stale-while-revalidate serves older boards
+    # instantly and refreshes Yahoo/news in the background.
+    dashboard_ttl_s: int = 120
+    dashboard_ttl_open_s: int = 45
     # Move size (%%) that counts as "already reacted"
     reaction_threshold_pct: float = 1.0
     # Floor for a story to promote a stock onto the session board
