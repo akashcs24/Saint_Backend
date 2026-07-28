@@ -154,7 +154,7 @@ def live_window_confirm(symbol: str, published_at) -> dict[str, Any]:
         return out
     news_idx = started.index[-1]
     loc = int(df.index.get_indexer([news_idx])[0])
-    if loc < 1 or loc + 1 >= len(df):
+    if loc < 1:
         return out
     # Prefer full window when after bars exist; else realtime (before+news).
     after = 2 if loc + 2 < len(df) else 1 if loc + 1 < len(df) else 0
@@ -216,6 +216,7 @@ def live_window_confirm(symbol: str, published_at) -> dict[str, Any]:
             "ready": True,
             "confirm": bool(confirm),
             "confirmRealtime": bool(rt_confirm),
+            "barsAfter": int(after),
             "rvolWindow": round(window_rvol, 3),
             "rvolMax": round(r_max, 3) if r_max is not None else None,
             "priceChangePct": round(px, 3) if px is not None else None,
@@ -224,6 +225,93 @@ def live_window_confirm(symbol: str, published_at) -> dict[str, Any]:
         }
     )
     return out
+
+
+def news_avwap_posture(symbol: str, published_at, *, is_long: bool) -> dict[str, Any]:
+    """Soft AVWAP from the news bar forward (doc: line in the sand)."""
+    out: dict[str, Any] = {"ready": False, "holds": None, "distPct": None, "avwap": None}
+    ts = _ist_naive(published_at)
+    if ts is None:
+        return out
+    df = _load_15m(symbol)
+    if df.empty or "Volume" not in df.columns:
+        return out
+    bars = df.loc[df.index >= ts.normalize()]
+    # From news timestamp onward (same day preferred).
+    bars = bars.loc[bars.index >= ts - pd.Timedelta(minutes=15)]
+    if len(bars) < 2:
+        return out
+    day = pd.Timestamp(bars.index[0]).normalize()
+    bars = bars.loc[bars["day"] == day] if "day" in bars.columns else bars
+    if len(bars) < 2:
+        return out
+    tp = (bars["High"] + bars["Low"] + bars["Close"]) / 3.0
+    vol = bars["Volume"].fillna(0.0).clip(lower=0.0)
+    cv = float(vol.sum())
+    if cv <= 0:
+        return out
+    avwap = float((tp * vol).sum() / cv)
+    last = float(bars.iloc[-1]["Close"])
+    dist = (last - avwap) / avwap * 100.0
+    holds = (last >= avwap) if is_long else (last <= avwap)
+    out.update(
+        {
+            "ready": True,
+            "avwap": round(avwap, 2),
+            "distPct": round(dist, 3),
+            "holds": bool(holds),
+        }
+    )
+    return out
+
+
+def build_vol_flags(
+    *,
+    closed_session_news: bool,
+    tape: dict | None,
+    open_snap: dict | None,
+    live_snap: dict | None,
+    action_confirm: str,
+) -> list[dict[str, str]]:
+    """Compact UI badges for the board."""
+    flags: list[dict[str, str]] = []
+    t = tape or {}
+    if closed_session_news:
+        if t.get("noDemand"):
+            flags.append({"key": "no_demand", "label": "No demand", "tone": "warn"})
+        elif t.get("noSupply"):
+            flags.append({"key": "no_supply", "label": "No supply", "tone": "gold"})
+        if t.get("volElevated") or t.get("volSurge"):
+            flags.append({"key": "vol_confirming", "label": "Vol confirming", "tone": "bull"})
+        if t.get("extendedAboveVwap"):
+            flags.append({"key": "extended", "label": "Extended VWAP", "tone": "warn"})
+        o = open_snap or {}
+        if o.get("ready") and o.get("elevated"):
+            if o.get("priceAlignedLong") or o.get("priceAlignedShort"):
+                flags.append({"key": "open_flow", "label": "Open flow", "tone": "bull"})
+            else:
+                flags.append({"key": "open_vol", "label": "Open vol", "tone": "gold"})
+    else:
+        lv = live_snap or {}
+        if lv.get("confirm") and (lv.get("priceAlignedLong") or lv.get("priceAlignedShort")):
+            flags.append({"key": "live_confirm", "label": "Live confirmed", "tone": "bull"})
+        elif lv.get("confirmRealtime") or lv.get("confirm"):
+            flags.append({"key": "live_vol", "label": "Live vol", "tone": "gold"})
+        elif lv.get("ready"):
+            flags.append({"key": "live_quiet", "label": "Live quiet", "tone": "muted"})
+    if action_confirm == "awaiting":
+        flags.append({"key": "awaiting", "label": "Awaiting confirm", "tone": "gold"})
+    elif action_confirm == "demoted":
+        flags.append({"key": "demoted", "label": "Vol demoted", "tone": "muted"})
+    # Dedupe by key
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+    for f in flags:
+        if f["key"] in seen:
+            continue
+        seen.add(f["key"])
+        out.append(f)
+    return out[:4]
 
 
 def apply_action_confirmation(
@@ -242,21 +330,44 @@ def apply_action_confirmation(
     status = "n/a"
     open_snap: dict = {}
     live_snap: dict = {}
+    avwap_snap: dict = {}
     tape_x = enrich_tape_scenarios(tape)
 
-    if act not in {"buy long", "buy", "buy short", "short"}:
+    def _pack(final_action: str, final_status: str) -> dict[str, Any]:
+        nonlocal note
+        if reasons:
+            tag = reasons[0]
+            note = f"{note} · {tag}" if note else tag
+        fa = final_action
+        if fa == "buy":
+            fa = "buy long"
+        if fa == "short":
+            fa = "buy short"
+        flags = build_vol_flags(
+            closed_session_news=closed_session_news,
+            tape=tape_x,
+            open_snap=open_snap,
+            live_snap=live_snap,
+            action_confirm=final_status,
+        )
         return {
-            "action": action,
+            "action": fa,
             "actionNote": note,
-            "actionConfirm": status,
-            "actionConfirmReasons": reasons,
-            "actionConfirmOk": True,
+            "actionConfirm": final_status,
+            "actionConfirmReasons": reasons[:4],
+            "actionConfirmOk": final_status in {"confirmed", "n/a"},
             "tapeConfirm": tape_x or None,
-            "openConfirm": None,
-            "liveConfirm": None,
+            "openConfirm": open_snap or None,
+            "liveConfirm": live_snap or None,
+            "avwapConfirm": avwap_snap or None,
+            "volFlags": flags,
         }
 
+    if act not in {"buy long", "buy", "buy short", "short"}:
+        return _pack(action, "n/a")
+
     is_long = act in {"buy long", "buy"}
+    pub = (anchor or {}).get("publishedAt")
 
     if closed_session_news:
         status = "confirmed"
@@ -264,9 +375,9 @@ def apply_action_confirmation(
         if is_long and tape_x.get("noDemand"):
             act = "watch"
             reasons.append("no demand on prior tape")
-            status = "demoted"
-        # P0 — overnight longs need elevated prior RVOL or quality tape
-        elif is_long:
+            return _pack(act, "demoted")
+
+        if is_long:
             quality = bool(
                 tape_x.get("volElevated")
                 or tape_x.get("volSurge")
@@ -276,53 +387,46 @@ def apply_action_confirmation(
             if extended:
                 act = "watch"
                 reasons.append("extended above VWAP — fade risk")
-                status = "demoted"
-            elif not quality and tape_x:
-                # Weak/quiet prior day — hold as watch until open confirms
-                if is_cash_session_open():
-                    open_snap = open_first_candle_confirm(symbol)
-                    if open_snap.get("ready") and open_snap.get("elevated"):
-                        aligned = open_snap.get("priceAlignedLong") if is_long else open_snap.get(
-                            "priceAlignedShort"
-                        )
-                        if aligned:
-                            status = "confirmed"
-                            reasons.append("open flow confirmed (weak prior tape)")
-                        else:
-                            act = "watch"
-                            reasons.append("open volume without price confirm")
-                            status = "awaiting"
-                    else:
-                        act = "watch"
-                        reasons.append("awaiting open volume confirm")
-                        status = "awaiting"
-                else:
+                return _pack(act, "demoted")
+
+            if not quality and tape_x:
+                if not is_cash_session_open():
                     act = "watch"
                     reasons.append("prior tape not elevated — wait for open")
-                    status = "awaiting"
-            else:
-                # Strong prior tape — still refine after open when available
-                if is_cash_session_open():
-                    open_snap = open_first_candle_confirm(symbol)
-                    if open_snap.get("ready"):
-                        aligned = (
-                            open_snap.get("priceAlignedLong")
-                            if is_long
-                            else open_snap.get("priceAlignedShort")
-                        )
-                        if open_snap.get("elevated") and aligned:
-                            reasons.append("open1 vol+price confirmed")
-                            status = "confirmed"
-                        elif open_snap.get("elevated") and aligned is False:
-                            act = "watch"
-                            reasons.append("open volume vs news price diverge")
-                            status = "demoted"
-                        # if open not elevated yet but prior was hot — keep buy
-                        elif not open_snap.get("elevated"):
-                            reasons.append("prior tape ok; open vol still quiet")
-                            status = "confirmed"
+                    return _pack(act, "awaiting")
+                open_snap = open_first_candle_confirm(symbol)
+                if open_snap.get("ready") and open_snap.get("elevated") and open_snap.get("priceAlignedLong"):
+                    reasons.append("open flow confirmed (weak prior tape)")
+                    status = "confirmed"
+                elif open_snap.get("ready") and open_snap.get("elevated"):
+                    act = "watch"
+                    reasons.append("open volume without price confirm")
+                    return _pack(act, "demoted")
+                else:
+                    act = "watch"
+                    reasons.append("awaiting open volume confirm")
+                    return _pack(act, "awaiting")
+            elif is_cash_session_open():
+                # Strong prior tape — refine with open1 when ready
+                open_snap = open_first_candle_confirm(symbol)
+                if open_snap.get("ready"):
+                    aligned = (
+                        open_snap.get("priceAlignedLong")
+                        if is_long
+                        else open_snap.get("priceAlignedShort")
+                    )
+                    if open_snap.get("elevated") and aligned:
+                        reasons.append("open1 vol+price confirmed")
+                        status = "confirmed"
+                    elif open_snap.get("elevated") and aligned is False:
+                        act = "watch"
+                        reasons.append("open volume vs news price diverge")
+                        return _pack(act, "demoted")
+                    else:
+                        reasons.append("prior tape ok; open vol still quiet")
+                        status = "confirmed"
         else:
-            # Shorts: optional open confirm when available (soft demote only on clear diverge)
+            # Shorts — soft open refine
             if is_cash_session_open():
                 open_snap = open_first_candle_confirm(symbol)
                 if open_snap.get("ready") and open_snap.get("elevated"):
@@ -332,50 +436,58 @@ def apply_action_confirmation(
                     elif open_snap.get("priceAlignedLong"):
                         act = "watch"
                         reasons.append("open flow against short thesis")
-                        status = "demoted"
-    else:
-        # Live session news — need 15m window confirm + price align
-        pub = (anchor or {}).get("publishedAt")
-        live_snap = live_window_confirm(symbol, pub)
-        vol_ok = bool(live_snap.get("confirm") or live_snap.get("confirmRealtime"))
-        aligned = (
-            live_snap.get("priceAlignedLong")
-            if is_long
-            else live_snap.get("priceAlignedShort")
-        )
-        if not live_snap.get("ready"):
-            act = "watch"
-            reasons.append("awaiting live volume window")
-            status = "awaiting"
-        elif vol_ok and aligned:
-            status = "confirmed"
-            reasons.append("live vol+price window confirmed")
-        elif vol_ok and aligned is False:
-            act = "watch"
-            reasons.append("live volume without price confirm")
-            status = "demoted"
-        else:
-            act = "watch"
-            reasons.append("live tape quiet — wait for volume")
-            status = "awaiting"
+                        return _pack(act, "demoted")
 
-    if reasons:
-        tag = reasons[0]
-        note = f"{note} · {tag}" if note else tag
+        # Soft AVWAP hold after open (does not demote alone if already confirmed)
+        if status == "confirmed" and is_cash_session_open() and pub:
+            avwap_snap = news_avwap_posture(symbol, pub, is_long=is_long)
+            if avwap_snap.get("ready") and avwap_snap.get("holds") is False:
+                act = "watch"
+                reasons.append("lost news-anchored AVWAP")
+                return _pack(act, "demoted")
+            if avwap_snap.get("ready") and avwap_snap.get("holds"):
+                reasons.append("holding news AVWAP")
 
-    # Normalize action labels
-    if act == "buy":
-        act = "buy long"
-    if act == "short":
-        act = "buy short"
+        return _pack(act, status)
 
-    return {
-        "action": act,
-        "actionNote": note,
-        "actionConfirm": status,
-        "actionConfirmReasons": reasons[:4],
-        "actionConfirmOk": status in {"confirmed", "n/a"},
-        "tapeConfirm": tape_x or None,
-        "openConfirm": open_snap or None,
-        "liveConfirm": live_snap or None,
-    }
+    # Live session — confirm delay: need ≥1 after-bar when possible
+    live_snap = live_window_confirm(symbol, pub)
+    bars_after = int(live_snap.get("barsAfter") or 0)
+    vol_ok = bool(live_snap.get("confirm"))
+    rt_ok = bool(live_snap.get("confirmRealtime"))
+    aligned = (
+        live_snap.get("priceAlignedLong") if is_long else live_snap.get("priceAlignedShort")
+    )
+
+    if not live_snap.get("ready"):
+        act = "watch"
+        reasons.append("awaiting live volume window")
+        return _pack(act, "awaiting")
+
+    if bars_after < 1:
+        # Confirm delay — print just hit; wait for next 15m bar
+        act = "watch"
+        reasons.append("awaiting next 15m bar for live confirm")
+        return _pack(act, "awaiting")
+
+    if vol_ok and aligned:
+        status = "confirmed"
+        reasons.append("live vol+price window confirmed")
+        if pub:
+            avwap_snap = news_avwap_posture(symbol, pub, is_long=is_long)
+            if avwap_snap.get("ready") and avwap_snap.get("holds") is False:
+                act = "watch"
+                reasons.append("live break of news AVWAP")
+                return _pack(act, "demoted")
+            if avwap_snap.get("ready") and avwap_snap.get("holds"):
+                reasons.append("holding news AVWAP")
+        return _pack(act, status)
+
+    if (vol_ok or rt_ok) and aligned is False:
+        act = "watch"
+        reasons.append("live volume without price confirm")
+        return _pack(act, "demoted")
+
+    act = "watch"
+    reasons.append("live tape quiet — wait for volume")
+    return _pack(act, "awaiting")

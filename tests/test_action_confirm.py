@@ -114,6 +114,7 @@ def test_live_vol_and_price_confirms():
             "ready": True,
             "confirm": True,
             "confirmRealtime": True,
+            "barsAfter": 2,
             "priceAlignedLong": True,
             "priceAlignedShort": False,
         },
@@ -128,6 +129,33 @@ def test_live_vol_and_price_confirms():
         )
     assert out["action"] == "buy long"
     assert out["actionConfirm"] == "confirmed"
+
+
+def test_live_awaits_next_bar_confirm_delay():
+    from app.action_confirm import apply_action_confirmation
+
+    with patch(
+        "app.action_confirm.live_window_confirm",
+        return_value={
+            "ready": True,
+            "confirm": True,
+            "confirmRealtime": True,
+            "barsAfter": 0,
+            "priceAlignedLong": True,
+            "priceAlignedShort": False,
+        },
+    ):
+        out = apply_action_confirmation(
+            "RELIANCE",
+            action="buy long",
+            action_note=None,
+            closed_session_news=False,
+            tape={},
+            anchor={"publishedAt": "2026-07-28T05:00:00+00:00"},
+        )
+    assert out["action"] == "watch"
+    assert out["actionConfirm"] == "awaiting"
+
 
 
 def test_alerts_skip_awaiting_confirm():

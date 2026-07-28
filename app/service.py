@@ -323,6 +323,8 @@ def aggregate_stock_sentiment(
         "tapeConfirm": tape or None,
         "openConfirm": None,
         "liveConfirm": None,
+        "avwapConfirm": None,
+        "volFlags": [],
     }
     if settings.action_confirm_enabled and action in {"buy long", "buy short"}:
         confirm = apply_action_confirmation(
@@ -368,6 +370,8 @@ def aggregate_stock_sentiment(
         "actionConfirmOk": bool(confirm.get("actionConfirmOk", True)),
         "openConfirm": confirm.get("openConfirm"),
         "liveConfirm": confirm.get("liveConfirm"),
+        "avwapConfirm": confirm.get("avwapConfirm"),
+        "volFlags": confirm.get("volFlags") or [],
         "signalTier": (
             "strong" if conviction >= 60 else "medium" if conviction >= 40 else "weak"
         ),
@@ -453,6 +457,8 @@ def build_stock_row(symbol: str, related_news: list[dict] | None = None) -> dict
         "actionConfirmOk": bool(read.get("actionConfirmOk", True)),
         "openConfirm": read.get("openConfirm"),
         "liveConfirm": read.get("liveConfirm"),
+        "avwapConfirm": read.get("avwapConfirm"),
+        "volFlags": read.get("volFlags") or [],
         "closedSessionNews": bool(read.get("closedSessionNews")),
         "nearestResistance": (read.get("structure") or {}).get("nearestResistance"),
         "nearestSupport": (read.get("structure") or {}).get("nearestSupport"),
