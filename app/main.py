@@ -38,15 +38,22 @@ def health(
     key: str | None = Query(None),
     x_saint_alerts_key: str | None = Header(None),
 ):
-    """Liveness probe. Optional ``?tick=1&key=...`` also runs alert scan.
+    """Liveness probe. Optional ``?tick=1&key=...`` kicks alert scan in background.
 
-    Free UptimeRobot often only allows HEAD. Point a second monitor at
-    ``/health?tick=1&key=SECRET`` so HEAD still wakes the server *and*
-    runs ENTRY/EXIT evaluation.
+    Free UptimeRobot HEAD probes time out if we block on Yahoo/dashboard.
+    Always return /health quickly; run ENTRY/EXIT on a daemon thread.
     """
+    tick_started = False
     if tick:
         _check_alerts_secret(key, x_saint_alerts_key)
-        run_alert_tick(force_dashboard=False)
+        import threading
+
+        threading.Thread(
+            target=lambda: run_alert_tick(force_dashboard=False),
+            daemon=True,
+            name="saint-alert-tick",
+        ).start()
+        tick_started = True
     return {
         "ok": True,
         "priceCache": str(settings.price_cache),
@@ -56,6 +63,7 @@ def health(
         "telegramConfigured": telegram_configured(),
         "alertsEnabled": alerts_enabled(),
         "tickRequested": bool(tick),
+        "tickStarted": tick_started,
     }
 
 
