@@ -235,6 +235,13 @@ def _entry_skip_reason(row: dict) -> str | None:
     if row.get("bucket") == "already_reacted" and action in {"already priced", "already fallen"}:
         return "already_reacted"
 
+    # Volume/price confirmation layer demoted or still awaiting → no ENTRY.
+    confirm = str(row.get("actionConfirm") or "").lower()
+    if confirm in {"demoted", "awaiting"}:
+        return f"action_confirm_{confirm}"
+    if row.get("actionConfirmOk") is False:
+        return "action_confirm_blocked"
+
     return None
 
 

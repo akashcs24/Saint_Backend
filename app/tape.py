@@ -87,6 +87,13 @@ def prior_tape(symbol: str) -> dict:
         sma = float(hist["Volume"].mean())
         vol_ratio = (volume / sma) if sma else None
 
+    prior_change_pct = None
+    hist_chg = daily.loc[daily.index.normalize() <= session_day.normalize()]
+    if len(hist_chg) >= 2:
+        prev_close = float(hist_chg.iloc[-2]["Close"])
+        if prev_close > 0:
+            prior_change_pct = round((close - prev_close) / prev_close * 100.0, 3)
+
     # Prefer 15m-reconstructed session VWAP; fall back to typical price.
     session_vwap = None
     try:
@@ -112,6 +119,7 @@ def prior_tape(symbol: str) -> dict:
         "extendedAboveVwap": extended,
         "volRatio20": round(vol_ratio, 3) if vol_ratio is not None else None,
         "volSurge": vol_surge,
+        "priorDayChangePct": prior_change_pct,
     }
 
 

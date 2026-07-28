@@ -18,6 +18,7 @@ from .tape import (
     tape_conviction_factor,
     tape_supports_buy as tape_supports_buy_fn,
 )
+from .action_confirm import apply_action_confirmation
 from .macro import build_macro_cards
 from .model_sentiment import blend_company_sentiment, finbert_enabled, score_headlines
 from .nifty_breadth import build_nifty_breadth
@@ -313,6 +314,28 @@ def aggregate_stock_sentiment(
             note = "opposing themes — wait for clarity"
     action = publish_signal(bias, action, conviction, conflict=conflict)
 
+    confirm: dict = {
+        "action": action,
+        "actionNote": note,
+        "actionConfirm": "n/a",
+        "actionConfirmReasons": [],
+        "actionConfirmOk": True,
+        "tapeConfirm": tape or None,
+        "openConfirm": None,
+        "liveConfirm": None,
+    }
+    if settings.action_confirm_enabled and action in {"buy long", "buy short"}:
+        confirm = apply_action_confirmation(
+            symbol,
+            action=action,
+            action_note=note,
+            closed_session_news=closed_news,
+            tape=tape,
+            anchor=anchor,
+        )
+        action = confirm["action"]
+        note = confirm.get("actionNote")
+
     expected = 1 if sent == "Positive" else -1 if sent == "Negative" else 0
     if anchor:
         story_dir = _story_direction(anchor)
@@ -336,10 +359,15 @@ def aggregate_stock_sentiment(
         "anchor": anchor,
         "structure": sr_pos or None,
         "breakoutLong": breakout_long,
-        "tape": tape or None,
+        "tape": confirm.get("tapeConfirm") or tape or None,
         "closedSessionNews": closed_news,
         "tapeFactor": tape_factor,
         "themeConflict": conflict,
+        "actionConfirm": confirm.get("actionConfirm"),
+        "actionConfirmReasons": confirm.get("actionConfirmReasons") or [],
+        "actionConfirmOk": bool(confirm.get("actionConfirmOk", True)),
+        "openConfirm": confirm.get("openConfirm"),
+        "liveConfirm": confirm.get("liveConfirm"),
         "signalTier": (
             "strong" if conviction >= 60 else "medium" if conviction >= 40 else "weak"
         ),
@@ -420,6 +448,12 @@ def build_stock_row(symbol: str, related_news: list[dict] | None = None) -> dict
         "structure": read.get("structure"),
         "breakoutLong": read.get("breakoutLong"),
         "tape": read.get("tape"),
+        "actionConfirm": read.get("actionConfirm"),
+        "actionConfirmReasons": read.get("actionConfirmReasons") or [],
+        "actionConfirmOk": bool(read.get("actionConfirmOk", True)),
+        "openConfirm": read.get("openConfirm"),
+        "liveConfirm": read.get("liveConfirm"),
+        "closedSessionNews": bool(read.get("closedSessionNews")),
         "nearestResistance": (read.get("structure") or {}).get("nearestResistance"),
         "nearestSupport": (read.get("structure") or {}).get("nearestSupport"),
         "distResistPct": (read.get("structure") or {}).get("distResistPct"),

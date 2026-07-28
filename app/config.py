@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     alerts_require_technicals: bool = False
     # Best-effort Gemini/OpenAI blurb on ENTRY; never blocks the Telegram send.
     alerts_ai_comment: bool = True
+    # Volume/price confirmation layer demotes buy long/short → watch when tape fails.
+    action_confirm_enabled: bool = True
     alerts_db: Path = Path(__file__).resolve().parent.parent / "data" / "alerts.sqlite3"
 
 
