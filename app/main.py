@@ -33,7 +33,20 @@ def _check_alerts_secret(
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
-def health():
+def health(
+    tick: bool = Query(False),
+    key: str | None = Query(None),
+    x_saint_alerts_key: str | None = Header(None),
+):
+    """Liveness probe. Optional ``?tick=1&key=...`` also runs alert scan.
+
+    Free UptimeRobot often only allows HEAD. Point a second monitor at
+    ``/health?tick=1&key=SECRET`` so HEAD still wakes the server *and*
+    runs ENTRY/EXIT evaluation.
+    """
+    if tick:
+        _check_alerts_secret(key, x_saint_alerts_key)
+        run_alert_tick(force_dashboard=False)
     return {
         "ok": True,
         "priceCache": str(settings.price_cache),
@@ -42,6 +55,7 @@ def health():
         "aiConfigured": ai_configured(),
         "telegramConfigured": telegram_configured(),
         "alertsEnabled": alerts_enabled(),
+        "tickRequested": bool(tick),
     }
 
 
