@@ -1,0 +1,33 @@
+# Render Blueprint — backend API for Saint Infinite Market
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: saint-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: SAINT_CORS_ORIGINS
+        sync: false
+      - key: SAINT_GEMINI_API_KEY
+        sync: false
+      - key: SAINT_AI_PROVIDER
+        value: gemini
+      - key: SAINT_GEMINI_MODEL
+        value: gemini-flash-latest
+      - key: SAINT_ALERTS_ENABLED
+        value: "true"
+      - key: SAINT_TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SAINT_TELEGRAM_CHAT_ID
+        sync: false
+      - key: SAINT_ALERTS_SECRET
+        sync: false
+      - key: SAINT_PRICE_CACHE
+        value: /tmp/saint_price_cache
+      - key: SAINT_PREDICTIONS_DB
+        value: /tmp/saint_predictions.sqlite3
+      - key: SAINT_ALERTS_DB
+        value: /tmp/saint_alerts.sqlite3
