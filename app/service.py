@@ -812,15 +812,28 @@ def build_dashboard() -> dict:
     all_stocks = [*buckets["next_session"], *buckets["live_session"], *buckets["already_reacted"]]
 
     # Indices / breadth / macro are independent — fetch concurrently.
+    # Isolate failures so one Yahoo/PCR blip cannot 500 the whole board.
     from concurrent.futures import ThreadPoolExecutor
 
+    indices: list = []
+    nifty_breadth = None
+    macro: list = []
     with ThreadPoolExecutor(max_workers=3) as pool:
         fut_idx = pool.submit(get_index_quotes)
         fut_breadth = pool.submit(build_nifty_breadth)
         fut_macro = pool.submit(build_macro_cards, 3)
-        indices = fut_idx.result()
-        nifty_breadth = fut_breadth.result()
-        macro = fut_macro.result()
+        try:
+            indices = fut_idx.result() or []
+        except Exception:  # noqa: BLE001
+            indices = []
+        try:
+            nifty_breadth = fut_breadth.result()
+        except Exception:  # noqa: BLE001
+            nifty_breadth = None
+        try:
+            macro = fut_macro.result() or []
+        except Exception:  # noqa: BLE001
+            macro = []
 
     def market_relevant(n: dict) -> bool:
         return n.get("scope") != "unclassified"
@@ -864,16 +877,43 @@ def build_dashboard() -> dict:
     }
 
 
-_DASH_CACHE: dict = {"ts": 0.0, "payload": None, "building": False}
+_DASH_CACHE: dict = {"ts": 0.0, "payload": None, "building": False, "lastError": None}
 _DASH_LOCK = __import__("threading").Lock()
+_DASH_DONE = __import__("threading").Event()
+
+
+def _empty_dashboard(*, error: str | None = None) -> dict:
+    """Minimal board so the Vercel UI can paint instead of spinning forever."""
+    return {
+        "asOf": datetime.now(timezone.utc).isoformat(),
+        "session": session_snapshot(),
+        "indices": [],
+        "niftyBreadth": None,
+        "buckets": {"next_session": [], "live_session": [], "already_reacted": []},
+        "topStocks": [],
+        "morningBrief": {
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "headline": "Board waking up",
+            "bullets": [error or "Waiting for first successful dashboard build."],
+        },
+        "news": [],
+        "macro": [],
+        "accuracy": None,
+        "cached": False,
+        "stale": True,
+        "error": error,
+    }
 
 
 def _store_dashboard(payload: dict) -> dict:
     payload = dict(payload)
     payload["cached"] = False
     payload["stale"] = False
+    payload.pop("error", None)
     _DASH_CACHE["ts"] = time.time()
     _DASH_CACHE["payload"] = payload
+    _DASH_CACHE["lastError"] = None
+    _DASH_DONE.set()
     return payload
 
 
@@ -883,12 +923,14 @@ def _rebuild_dashboard_bg(*, force: bool = False) -> None:
         if _DASH_CACHE["building"]:
             return
         _DASH_CACHE["building"] = True
+        _DASH_DONE.clear()
     try:
         payload = build_dashboard()
         _store_dashboard(payload)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         # Keep last good cache; next request can retry.
-        pass
+        _DASH_CACHE["lastError"] = f"{type(exc).__name__}: {exc}"
+        _DASH_DONE.set()
     finally:
         with _DASH_LOCK:
             _DASH_CACHE["building"] = False
@@ -924,14 +966,34 @@ def get_dashboard(*, force: bool = False) -> dict:
             t.start()
         return out
 
-    # Cold start — nothing to serve yet; must build synchronously once.
+    # Cold start — single-flight. Concurrent callers wait instead of double-building
+    # (UptimeRobot alert tick + Vercel board used to stampede free Render).
+    start_build = False
     with _DASH_LOCK:
-        # Another request may have started building.
-        if _DASH_CACHE["building"] and _DASH_CACHE["payload"] is None:
-            pass
-        _DASH_CACHE["building"] = True
+        if _DASH_CACHE["payload"] is not None and not force:
+            out = dict(_DASH_CACHE["payload"])
+            out["cached"] = True
+            out["stale"] = False
+            return out
+        if _DASH_CACHE["building"]:
+            start_build = False
+        else:
+            _DASH_CACHE["building"] = True
+            _DASH_DONE.clear()
+            start_build = True
+
+    if not start_build:
+        # Wait up to 90s for the in-flight cold build.
+        _DASH_DONE.wait(timeout=90)
+        if _DASH_CACHE["payload"] is not None:
+            out = dict(_DASH_CACHE["payload"])
+            out["cached"] = True
+            out["stale"] = False
+            return out
+        err = _DASH_CACHE.get("lastError") or "Dashboard build still running or failed."
+        return _empty_dashboard(error=str(err))
+
     try:
-        # Re-check: background may have finished.
         if _DASH_CACHE["payload"] is not None and not force:
             out = dict(_DASH_CACHE["payload"])
             out["cached"] = True
@@ -939,9 +1001,21 @@ def get_dashboard(*, force: bool = False) -> dict:
             return out
         payload = build_dashboard()
         return _store_dashboard(payload)
+    except Exception as exc:  # noqa: BLE001
+        _DASH_CACHE["lastError"] = f"{type(exc).__name__}: {exc}"
+        _DASH_DONE.set()
+        # Prefer any prior cache; otherwise return a paint-able empty board + error.
+        if _DASH_CACHE["payload"] is not None:
+            out = dict(_DASH_CACHE["payload"])
+            out["cached"] = True
+            out["stale"] = True
+            out["error"] = _DASH_CACHE["lastError"]
+            return out
+        return _empty_dashboard(error=_DASH_CACHE["lastError"])
     finally:
         with _DASH_LOCK:
             _DASH_CACHE["building"] = False
+        _DASH_DONE.set()
 
 
 def build_stock_detail(symbol: str) -> dict | None:

@@ -54,6 +54,8 @@ def health(
             name="saint-alert-tick",
         ).start()
         tick_started = True
+    from .service import _DASH_CACHE
+
     return {
         "ok": True,
         "priceCache": str(settings.price_cache),
@@ -64,12 +66,22 @@ def health(
         "alertsEnabled": alerts_enabled(),
         "tickRequested": bool(tick),
         "tickStarted": tick_started,
+        "dashboardCached": _DASH_CACHE.get("payload") is not None,
+        "dashboardBuilding": bool(_DASH_CACHE.get("building")),
+        "dashboardLastError": _DASH_CACHE.get("lastError"),
     }
 
 
 @app.get("/api/dashboard")
 def dashboard(force: bool = Query(False)):
-    return get_dashboard(force=force)
+    """Board payload. Never bare-500 on cold start — returns empty board + error."""
+    try:
+        return get_dashboard(force=force)
+    except Exception as exc:  # noqa: BLE001
+        # Last-resort shield so Vercel stops spinning on uncaught bugs.
+        from .service import _empty_dashboard
+
+        return _empty_dashboard(error=f"{type(exc).__name__}: {exc}")
 
 
 @app.get("/api/stocks/{symbol}")
