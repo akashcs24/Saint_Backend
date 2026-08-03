@@ -507,6 +507,15 @@ def exchange_auth_code(auth_code_or_url: str) -> dict[str, Any]:
         pass
     # Prove the new token works before returning green (also after hours).
     verify_fyers_token(force=True)
+    try:
+        from .fyers_quotes import ensure_fyers_poller
+        from .nifty_weights import get_nifty_weights
+        from .universe import UNIVERSE
+
+        weights = get_nifty_weights().get("weights") or {}
+        ensure_fyers_poller([s for s in weights if s in UNIVERSE])
+    except Exception:  # noqa: BLE001
+        pass
     return fyers_status(verify=False, force_verify=False)
 
 

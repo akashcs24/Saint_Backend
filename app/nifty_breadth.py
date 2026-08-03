@@ -23,7 +23,14 @@ _FLAT_PCT = 0.05
 _LEAN_PCT = 0.12
 _WEIGHT_TREND_EPS = 1.0  # percentage points of decline-weight
 _BREADTH_CACHE: dict = {"ts": 0.0, "payload": None}
-_BREADTH_TTL_S = 90.0  # reuse breadth board across dashboard rebuilds
+_BREADTH_TTL_S = 90.0  # reuse breadth board across dashboard rebuilds (Yahoo)
+_BREADTH_TTL_FYERS_S = 1.0  # live poller refreshes quotes every ~1s per batch
+
+
+def _breadth_ttl_s() -> float:
+    if get_access_token():
+        return _BREADTH_TTL_FYERS_S
+    return _BREADTH_TTL_S
 
 
 def _side(change_pct: float) -> str:
@@ -39,10 +46,11 @@ def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
     import time
 
     now = time.time()
+    ttl = _breadth_ttl_s()
     if (
         not force
         and _BREADTH_CACHE["payload"] is not None
-        and now - float(_BREADTH_CACHE["ts"]) < _BREADTH_TTL_S
+        and now - float(_BREADTH_CACHE["ts"]) < ttl
     ):
         out = dict(_BREADTH_CACHE["payload"])
         out["cached"] = True

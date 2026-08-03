@@ -19,6 +19,23 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Saint Infinite Market API", version="0.1.0")
 
+
+@app.on_event("startup")
+def _startup_fyers_poller() -> None:
+    """Warm Fyers batch poller when a token is already on disk."""
+    try:
+        from .fyers_quotes import ensure_fyers_poller
+        from .nifty_weights import get_nifty_weights
+        from .universe import UNIVERSE
+
+        if get_access_token():
+            weights = get_nifty_weights().get("weights") or {}
+            symbols = [s for s in weights if s in UNIVERSE]
+            ensure_fyers_poller(symbols)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,

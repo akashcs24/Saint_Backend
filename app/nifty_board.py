@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .fyers_auth import get_access_token, fyers_status
-from .fyers_quotes import fetch_fyers_quotes
+from .fyers_quotes import ensure_fyers_poller, fetch_fyers_quotes
 from .nifty_breadth import build_nifty_breadth
 from .nifty_breadth_history import breadth_history, record_breadth_snapshot
 from .nifty_chain import atm_wing_board, enrich_oi_plot, fetch_nifty_option_chain, oi_insights
@@ -33,6 +33,7 @@ _BOARD_CACHE: dict[str, Any] = {
 _BOARD_LOCK = threading.Lock()
 _BOARD_DONE = threading.Event()
 _BOARD_TTL_S = 30.0
+_BOARD_LIVE_TTL_S = 1.0  # Fyers breadth/spot slice when poller is running
 _BOARD_TTL_CLOSED_S = 15 * 60.0  # after close, reuse last board — no live churn
 
 
@@ -74,6 +75,7 @@ def _store_nifty_board(payload: dict[str, Any]) -> dict[str, Any]:
     payload["building"] = False
     payload.pop("error", None)
     _BOARD_CACHE["ts"] = time.time()
+    _BOARD_CACHE["heavy_ts"] = time.time()
     _BOARD_CACHE["payload"] = payload
     _BOARD_CACHE["lastError"] = None
     _BOARD_DONE.set()
@@ -107,6 +109,87 @@ def _kick_rebuild(*, force: bool = False) -> None:
     ).start()
 
 
+def _refresh_live_slice(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fast path: refresh Fyers-driven breadth/spot/sync without OI/AI/chain."""
+    weight_pack = get_nifty_weights()
+    symbols = [s for s in (weight_pack.get("weights") or {}) if s in UNIVERSE]
+    if get_access_token() and symbols:
+        ensure_fyers_poller(symbols)
+
+    breadth = build_nifty_breadth(force=True) or {}
+    index = _index_quote()
+    spot = payload.get("optionOi", {}).get("spot") or index.get("ltp")
+    if spot is None:
+        spot = payload.get("index", {}).get("ltp")
+
+    lead = _lead_lag(breadth, index, spot=float(spot) if spot is not None else None)
+    futures = payload.get("futures") if isinstance(payload.get("futures"), dict) else {}
+    stock_fut = (
+        payload.get("stockFutBasket")
+        if isinstance(payload.get("stockFutBasket"), dict)
+        else {}
+    )
+    market_sync = build_market_sync_card(
+        cash_basket_pct=lead.get("basketMovePct"),
+        nifty_spot_pct=lead.get("indexMovePct"),
+        stock_fut_basket_pct=stock_fut.get("basketMovePct") if stock_fut.get("ready") else None,
+        nifty_fut_pct=futures.get("changePct") if futures.get("ready") else None,
+        spot=float(spot) if spot is not None else None,
+        nifty_fut_ltp=float(futures["ltp"]) if futures.get("ltp") is not None else None,
+        stock_fut_meta=stock_fut,
+    )
+    sync_insight = combine_sync_insight(
+        index_vs_basket_pp=lead.get("indexVsBasketPp"),
+        cash_stance=str(lead.get("stance") or "unclear"),
+        futures=futures if futures.get("ready") else None,
+    )
+    lead["syncInsight"] = market_sync.get("insight") or sync_insight
+    lead["marketSync"] = market_sync
+
+    segments = list(breadth.get("segments") or [])
+    ups = sorted(
+        [s for s in segments if s.get("side") == "up"],
+        key=lambda x: -float(x.get("weight") or 0),
+    )
+    downs = sorted(
+        [s for s in segments if s.get("side") == "down"],
+        key=lambda x: -float(x.get("weight") or 0),
+    )
+
+    out = dict(payload)
+    out["asOf"] = datetime.now(timezone.utc).isoformat()
+    out["fyersConnected"] = bool(fyers_status(verify=False).get("connected"))
+    out["index"] = index
+    out["breadth"] = {
+        "ready": bool(breadth.get("ready")),
+        "advances": breadth.get("advances"),
+        "declines": breadth.get("declines"),
+        "unchanged": breadth.get("unchanged"),
+        "quoted": breadth.get("quoted"),
+        "universe": breadth.get("universe"),
+        "weightUp": breadth.get("weightUp"),
+        "weightDown": breadth.get("weightDown"),
+        "weightFlat": breadth.get("weightFlat"),
+        "contributionPct": breadth.get("contributionPct"),
+        "lean": breadth.get("lean"),
+        "action": breadth.get("action"),
+        "label": breadth.get("label"),
+        "quoteSource": breadth.get("quoteSource")
+        or (breadth.get("weightsMeta") or {}).get("quoteSource"),
+        "segments": segments,
+        "weightTrend": breadth.get("weightTrend"),
+    }
+    out["drivers"] = {"topUp": ups[:10], "topDown": downs[:10]}
+    out["leadLag"] = lead
+    out["marketSync"] = market_sync
+    out["liveRefresh"] = True
+    out["cached"] = True
+    out["stale"] = False
+    _BOARD_CACHE["payload"] = out
+    _BOARD_CACHE["ts"] = time.time()
+    return out
+
+
 def get_nifty_board(*, force: bool = False) -> dict[str, Any]:
     """Serve cached board instantly; never block HTTP on a cold Yahoo/Fyers rebuild."""
     now = time.time()
@@ -116,6 +199,21 @@ def get_nifty_board(*, force: bool = False) -> dict[str, Any]:
     age = now - float(_BOARD_CACHE["ts"]) if cached is not None else None
 
     if cached is not None:
+        fyers_live = bool(get_access_token()) and in_hours
+        heavy_ts = float(_BOARD_CACHE.get("heavy_ts") or _BOARD_CACHE["ts"] or now)
+        heavy_age = now - heavy_ts
+
+        if fyers_live and age is not None and age >= _BOARD_LIVE_TTL_S and not force:
+            out = _refresh_live_slice(dict(cached))
+            out["cacheAgeS"] = 0.0
+            out["building"] = bool(_BOARD_CACHE.get("building"))
+            out["marketHours"] = in_hours
+            out["marketHoursLabel"] = live_data_window_label()
+            out["liveDataPaused"] = False
+            if heavy_age >= _BOARD_TTL_S:
+                _kick_rebuild(force=False)
+            return out
+
         out = dict(cached)
         out["cached"] = True
         out["cacheAgeS"] = round(float(age or 0), 1)
