@@ -33,7 +33,7 @@ _BOARD_CACHE: dict[str, Any] = {
 _BOARD_LOCK = threading.Lock()
 _BOARD_DONE = threading.Event()
 _BOARD_TTL_S = 30.0
-_BOARD_LIVE_TTL_S = 1.0  # Fyers breadth/spot slice when poller is running
+_BOARD_LIVE_TTL_S = 2.0  # Fyers breadth/spot slice when poller is running
 _BOARD_PAPER_TICK_S = 60.0  # evaluate paper books during live refresh
 _BOARD_TTL_CLOSED_S = 15 * 60.0  # after close, reuse last board — no live churn
 

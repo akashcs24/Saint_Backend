@@ -192,7 +192,9 @@ def nifty_paper_trades(limit: int = Query(40, ge=1, le=200), evaluate: bool = Qu
         from .session import is_live_data_window
 
         if evaluate and is_live_data_window() and get_access_token():
-            tick_paper_trades(force=False)
+            from .nifty_paper_trades import maybe_evaluate_paper_trades
+
+            maybe_evaluate_paper_trades()
         return paper_trades_board(limit_per=limit)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc

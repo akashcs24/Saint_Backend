@@ -23,7 +23,7 @@ _FYERS_OVERRIDES: dict[str, str] = {
 }
 
 FYERS_BATCH_SIZE = 40
-FYERS_BATCH_INTERVAL_S = 1.0
+FYERS_BATCH_INTERVAL_S = 2.0
 
 _live_cache: dict[str, tuple[float, Quote]] = {}
 _live_lock = threading.Lock()
@@ -262,3 +262,16 @@ def fetch_fyers_quotes(symbols: list[str]) -> dict[str, Quote]:
             time.sleep(FYERS_BATCH_INTERVAL_S)
     _store_live_quotes(out)
     return out
+
+
+def fetch_fyers_symbol_ltp(fyers_symbol: str) -> float | None:
+    """Single-symbol LTP (equity or option ticker) via Fyers."""
+    from .session import is_live_data_window
+
+    sym = (fyers_symbol or "").strip()
+    if not sym or not is_live_data_window() or not get_access_token():
+        return None
+    fyers_to_saint = {sym: sym}
+    q = _fetch_fyers_batch([sym], fyers_to_saint)
+    hit = q.get(sym)
+    return float(hit.ltp) if hit else None

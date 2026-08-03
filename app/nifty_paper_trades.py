@@ -70,6 +70,10 @@ STRATEGIES: dict[str, dict[str, Any]] = {
 }
 
 _lock = Lock()
+_LIVE_LTP_CACHE: dict[str, Any] = {"ts": 0.0, "payload": None}
+_LIVE_LTP_TTL_S = 2.0
+_LAST_EVAL_TS = 0.0
+_EVAL_MIN_S = 60.0
 
 
 def list_strategies() -> list[dict[str, Any]]:
@@ -483,6 +487,70 @@ def paper_trade_summary(strategy_id: str = "decline") -> dict[str, Any]:
     return _summary_for(strategy_id, trades)
 
 
+def _paper_live_ltp(con: sqlite3.Connection) -> dict[str, Any]:
+    """Cached 2s LTP for ATM + each open position strike (Fyers)."""
+    from .fyers_auth import get_access_token
+    from .fyers_quotes import fetch_fyers_symbol_ltp
+
+    if not is_live_data_window() or not get_access_token():
+        return {}
+    now = time.time()
+    cached = _LIVE_LTP_CACHE.get("payload")
+    if cached and now - float(_LIVE_LTP_CACHE.get("ts") or 0) < _LIVE_LTP_TTL_S:
+        return dict(cached)
+
+    atm = _atm_ce_quote()
+    positions: dict[str, Any] = {}
+    for sid in STRATEGIES:
+        row = con.execute(
+            """
+            SELECT symbol, strike, entry_px FROM paper_trades
+            WHERE status='open' AND strategy_id=? ORDER BY id DESC LIMIT 1
+            """,
+            (sid,),
+        ).fetchone()
+        if not row:
+            continue
+        sym = str(row["symbol"] or "")
+        ltp = fetch_fyers_symbol_ltp(sym) if sym.startswith("NSE:") else None
+        if ltp is None and atm and row["strike"] is not None and atm.get("strike") is not None:
+            if float(row["strike"]) == float(atm["strike"]):
+                ltp = atm.get("ltp")
+        entry = float(row["entry_px"])
+        positions[sid] = {
+            "symbol": sym,
+            "strike": row["strike"],
+            "ltp": ltp,
+            "entryPx": entry,
+            "pnlRs": round((float(ltp) - entry) * LOT_SIZE, 2) if ltp is not None else None,
+            "pnlPct": round((float(ltp) / entry - 1.0) * 100.0, 2) if ltp is not None and entry else None,
+        }
+
+    payload = {
+        "asOf": datetime.now(timezone.utc).isoformat(),
+        "atm": atm,
+        "positions": positions,
+        "source": (atm or {}).get("source") or ("fyers" if positions else None),
+    }
+    _LIVE_LTP_CACHE["ts"] = now
+    _LIVE_LTP_CACHE["payload"] = payload
+    return payload
+
+
+def maybe_evaluate_paper_trades() -> None:
+    """Throttled strategy evaluation (entry/exit) — not on every LTP poll."""
+    global _LAST_EVAL_TS
+    from .fyers_auth import get_access_token
+
+    if not is_live_data_window() or not get_access_token():
+        return
+    now = time.time()
+    if now - _LAST_EVAL_TS < _EVAL_MIN_S:
+        return
+    _LAST_EVAL_TS = now
+    tick_paper_trades(force=False)
+
+
 def paper_entry_signal() -> dict[str, Any]:
     """Explain why decline/tsl did or did not enter (5m weightUp streaks)."""
     rows = _chrono_weight_up(8)
@@ -517,6 +585,22 @@ def paper_trades_board(
         try:
             board = _board_unlocked(con, limit_per, mark_ltp=mark_ltp)
             board["signal"] = paper_entry_signal()
+            live = _paper_live_ltp(con)
+            if live:
+                board["liveLtp"] = live
+                # Attach mark to open rows for the trade log UI.
+                pos_map = live.get("positions") or {}
+                for bucket in board.get("buckets") or []:
+                    sid = bucket.get("strategyId")
+                    mark = pos_map.get(sid) if sid else None
+                    if mark and bucket.get("summary"):
+                        bucket["summary"]["markLtp"] = mark.get("ltp")
+                        bucket["summary"]["markPnlRs"] = mark.get("pnlRs")
+                    for tr in bucket.get("trades") or []:
+                        if tr.get("status") == "open" and sid in pos_map:
+                            tr["markLtp"] = pos_map[sid].get("ltp")
+                            tr["markPnlRs"] = pos_map[sid].get("pnlRs")
+                            tr["markPnlPct"] = pos_map[sid].get("pnlPct")
             return board
         finally:
             con.close()
