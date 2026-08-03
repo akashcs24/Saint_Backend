@@ -31,3 +31,13 @@ services:
         value: /tmp/saint_predictions.sqlite3
       - key: SAINT_ALERTS_DB
         value: /tmp/saint_alerts.sqlite3
+      - key: SAINT_MONGODB_URI
+        sync: false
+      - key: SAINT_MONGODB_DB
+        value: saint
+      - key: FYERS_APP_ID
+        sync: false
+      - key: FYERS_SECRET_KEY
+        sync: false
+      - key: FYERS_REDIRECT_URI
+        value: https://trade.fyers.in/api-login/redirect-uri/index.html

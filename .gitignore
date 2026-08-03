@@ -9,5 +9,12 @@ __pycache__/
 data/*.sqlite3
 data/*.db
 data/alerts.sqlite3
+data/fyers_token.json
+data/fyers_logs/
+data/nifty_breadth_history.json
+data/nifty_pcr_history.json
+data/nifty_weights_cache.json
+data/price_cache/
+data/price_cache_*/
 *.log
 .DS_Store

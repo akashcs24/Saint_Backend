@@ -486,14 +486,41 @@ def evaluate_board(stocks: list[dict]) -> list[dict]:
 
 
 def run_alert_tick(*, force_dashboard: bool = False) -> dict[str, Any]:
-    """Scan board → send new ENTRY and EXIT Telegram alerts."""
+    """Scan board → send new ENTRY and EXIT Telegram alerts.
+
+    Also rebuilds the Nifty board during cash hours so paper trades evaluate
+    even when Telegram alerts are off (UptimeRobot /health?tick=1 path).
+    """
     started = time.time()
+
+    def _nifty_paper_side() -> dict[str, Any] | None:
+        try:
+            from .nifty_board import build_nifty_board
+            from .session import is_live_data_window
+
+            if not (is_live_data_window() or force_dashboard):
+                return {"ok": True, "skipped": "outside_hours"}
+            board = build_nifty_board(force=False)
+            pt = board.get("paperTrades") if isinstance(board, dict) else None
+            if isinstance(pt, dict):
+                return {
+                    "ok": pt.get("ok"),
+                    "skipped": pt.get("skipped"),
+                    "events": pt.get("events"),
+                    "error": pt.get("error"),
+                }
+            return {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
     if not alerts_enabled():
+        nifty_paper = _nifty_paper_side()
         return {
             "ok": True,
             "enabled": False,
             "reason": "alerts_disabled_or_telegram_not_configured",
             "sent": [],
+            "niftyPaper": nifty_paper,
             "elapsedMs": int((time.time() - started) * 1000),
         }
 
@@ -540,6 +567,8 @@ def run_alert_tick(*, force_dashboard: bool = False) -> dict[str, Any]:
             }
         )
 
+    nifty_paper = _nifty_paper_side()
+
     return {
         "ok": True,
         "enabled": True,
@@ -548,6 +577,7 @@ def run_alert_tick(*, force_dashboard: bool = False) -> dict[str, Any]:
         "exitCandidates": len(exits),
         "sent": sent,
         "errors": errors,
+        "niftyPaper": nifty_paper,
         "elapsedMs": int((time.time() - started) * 1000),
         "asOf": datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"),
     }

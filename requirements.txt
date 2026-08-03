@@ -10,3 +10,8 @@ pydantic-settings>=2.0.0
 nse-calendar>=1.0.0
 beautifulsoup4>=4.12.0
 requests>=2.31.0
+fyers-apiv3>=3.1.0
+python-dotenv>=1.0.0
+
+pymongo>=4.6.0
+certifi>=2024.0.0

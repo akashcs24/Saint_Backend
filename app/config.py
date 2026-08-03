@@ -17,10 +17,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Absolute or relative path to the NSE parquet cache (Yahoo tickers like RELIANCE.NS.parquet)
-    price_cache: Path = Path(
-        "/Users/akashcs/Chartink/Chartink conditions/New Folder With Items/data/price_cache"
-    )
+    # NSE parquet cache (Yahoo tickers like RELIANCE.NS.parquet).
+    # Default: local backend/data/price_cache (Saint-only). For research tapes, set
+    # SAINT_PRICE_CACHE to New Folder With Items/data/price_cache in backend/.env.
+    price_cache: Path = Path(__file__).resolve().parent.parent / "data" / "price_cache"
     # How long (seconds) to cache Yahoo quote snapshots in memory
     quote_ttl_s: int = 120
     # Near cash open (09:15–09:45) we poll quotes much harder for gap validation
@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     board_min_credibility: float = 0.55
     # SQLite file for prediction snapshots / verification history
     predictions_db: Path = Path(__file__).resolve().parent.parent / "data" / "predictions.sqlite3"
+    # Optional MongoDB for paper trades / shared state (Render Atlas URI)
+    mongodb_uri: str = ""
+    mongodb_db: str = "saint"
     # Optional India FinBERT for direct company headlines (off by default)
     use_finbert: bool = False
     # Allow browser calls from the Vite app

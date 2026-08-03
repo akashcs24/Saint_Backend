@@ -14,6 +14,9 @@ from zoneinfo import ZoneInfo
 IST = ZoneInfo("Asia/Kolkata")
 SESSION_OPEN = time(9, 15)
 SESSION_CLOSE = time(15, 30)
+# Live quotes / Fyers / Nifty board refresh window (slightly before cash open).
+LIVE_DATA_OPEN = time(9, 14)
+LIVE_DATA_CLOSE = time(15, 30)
 # First verification checkpoint after open for overnight / next-session calls.
 OPEN_PLUS_MINUTES = 30
 
@@ -116,6 +119,24 @@ def is_cash_session_open(when: datetime | None = None) -> bool:
         return False
     open_dt, close_dt = session_bounds(now.date())
     return open_dt <= now <= close_dt
+
+
+def is_live_data_window(when: datetime | None = None) -> bool:
+    """True Mon–Fri (trading days) 09:14–15:30 IST.
+
+    Use this to pause Fyers probes, Nifty board live refresh, and Gemini OI
+    insights overnight so we do not burn tokens after the cash close.
+    """
+    now = now_ist(when)
+    if not is_trading_day(now.date()):
+        return False
+    start = datetime.combine(now.date(), LIVE_DATA_OPEN, tzinfo=IST)
+    end = datetime.combine(now.date(), LIVE_DATA_CLOSE, tzinfo=IST)
+    return start <= now <= end
+
+
+def live_data_window_label() -> str:
+    return "09:14–15:30 IST · trading days"
 
 
 # First half-hour after open: gap filter + early thesis validation window.

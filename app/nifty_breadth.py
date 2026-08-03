@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from .fyers_auth import get_access_token
+from .fyers_quotes import fetch_fyers_quotes
 from .nifty_pcr import fetch_nifty_pcr
 from .nifty_weights import get_nifty_weights
 from .quotes import get_quote
@@ -50,19 +52,33 @@ def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
     nifty_weights: dict[str, float] = weight_pack.get("weights") or {}
     symbols = [s for s in nifty_weights if s in UNIVERSE]
     quotes: dict[str, object] = {}
+    quote_source = "yahoo"
+
+    # Prefer Fyers realtime when the user has connected from the app header.
+    if get_access_token():
+        fyers_map = fetch_fyers_quotes(symbols)
+        if fyers_map:
+            quotes.update(fyers_map)
+            quote_source = "fyers"
+
+    # Fill any gaps with Yahoo (or all-Yahoo when Fyers not connected).
+    missing = [s for s in symbols if s not in quotes]
 
     def _one(sym: str):
         return sym, get_quote(sym)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futs = [pool.submit(_one, s) for s in symbols]
-        for fut in as_completed(futs):
-            try:
-                sym, q = fut.result()
-            except Exception:  # noqa: BLE001
-                continue
-            if q is not None:
-                quotes[sym] = q
+    if missing:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futs = [pool.submit(_one, s) for s in missing]
+            for fut in as_completed(futs):
+                try:
+                    sym, q = fut.result()
+                except Exception:  # noqa: BLE001
+                    continue
+                if q is not None:
+                    quotes[sym] = q
+        if quote_source == "fyers" and missing:
+            quote_source = "fyers+yahoo"
 
     pcr = fetch_nifty_pcr()
     weights_meta = {
@@ -70,6 +86,7 @@ def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
         "count": weight_pack.get("count"),
         "fetchedAt": weight_pack.get("fetchedAt"),
         "unmapped": weight_pack.get("unmapped") or [],
+        "quoteSource": quote_source,
     }
 
     if not quotes:
@@ -163,16 +180,17 @@ def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
         lean, action = "mixed", "watch"
         label = "Breadth mixed — no clear Nifty lean"
 
-    movers_sorted = sorted(movers, key=lambda x: x[3])
-    top_down = [
-        {"symbol": s, "changePct": round(c, 2), "weight": round(w, 2), "contributionPct": round(x, 3)}
-        for s, c, w, x, _side_name in movers_sorted[:3]
-        if x < 0
-    ]
     top_up = [
         {"symbol": s, "changePct": round(c, 2), "weight": round(w, 2), "contributionPct": round(x, 3)}
-        for s, c, w, x, _side_name in reversed(movers_sorted[-3:])
-        if x > 0
+        for s, c, w, x, _side_name in sorted(
+            [m for m in movers if m[4] == "up"], key=lambda m: -m[2]
+        )[:3]
+    ]
+    top_down = [
+        {"symbol": s, "changePct": round(c, 2), "weight": round(w, 2), "contributionPct": round(x, 3)}
+        for s, c, w, x, _side_name in sorted(
+            [m for m in movers if m[4] == "down"], key=lambda m: -m[2]
+        )[:3]
     ]
 
     ups = sorted([m for m in movers if m[4] == "up"], key=lambda m: -m[2])
@@ -218,6 +236,7 @@ def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
         "segments": segments,
         "pcr": pcr,
         "weightsMeta": weights_meta,
+        "quoteSource": quote_source,
         "weightTrend": weight_trend,
         "cached": False,
     }
