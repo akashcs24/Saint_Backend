@@ -72,6 +72,12 @@ def health(
                 run_alert_tick(force_dashboard=False)
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                from .nifty_board import _kick_rebuild
+
+                _kick_rebuild(force=False)
+            except Exception:  # noqa: BLE001
+                pass
 
         threading.Thread(
             target=_bg_tick,
@@ -152,11 +158,13 @@ def dashboard(force: bool = Query(False)):
 def nifty_board(force: bool = Query(False)):
     """Nifty 50 page: index, breadth, drivers, OI wings, PCR history, lead/lag."""
     try:
-        from .nifty_board import build_nifty_board
+        from .nifty_board import get_nifty_board
 
-        return build_nifty_board(force=force)
+        return get_nifty_board(force=force)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+        from .nifty_board import _empty_nifty_board
+
+        return _empty_nifty_board(error=f"{type(exc).__name__}: {exc}")
 
 
 @app.get("/api/nifty/paper-trades")

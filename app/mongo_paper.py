@@ -5,11 +5,11 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from .mongo import mongodb_configured, paper_trades_collection
+from .mongo import mongodb_configured, mongo_is_reachable, paper_trades_collection
 
 
 def mongo_paper_enabled() -> bool:
-    return mongodb_configured() and paper_trades_collection() is not None
+    return mongodb_configured() and mongo_is_reachable() and paper_trades_collection() is not None
 
 
 def _doc_from_row_dict(trade: dict[str, Any], *, sqlite_id: int | None = None) -> dict[str, Any]:
@@ -43,6 +43,8 @@ def _doc_from_row_dict(trade: dict[str, Any], *, sqlite_id: int | None = None) -
 
 def upsert_paper_trade(trade: dict[str, Any], *, sqlite_id: int | None = None) -> bool:
     """Upsert one trade keyed by (strategyId, entryTs, symbol) or sqliteId."""
+    if not mongo_is_reachable():
+        return False
     col = paper_trades_collection()
     if col is None:
         return False
@@ -65,6 +67,8 @@ def upsert_paper_trade(trade: dict[str, Any], *, sqlite_id: int | None = None) -
 def list_mongo_paper_trades(
     limit: int = 50, *, strategy_id: str | None = None
 ) -> list[dict[str, Any]]:
+    if not mongo_is_reachable():
+        return []
     col = paper_trades_collection()
     if col is None:
         return []

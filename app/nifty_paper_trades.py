@@ -78,11 +78,11 @@ def list_strategies() -> list[dict[str, Any]]:
 
 def _mongo_ready_flag() -> bool:
     try:
-        from .mongo import mongo_ping
+        from .mongo import mongo_is_reachable
 
-        return bool(mongo_ping().get("ok"))
+        return mongo_is_reachable()
     except Exception:  # noqa: BLE001
-        return bool(getattr(settings, "mongodb_uri", "") or "")
+        return False
 
 
 def _storage_label() -> str:

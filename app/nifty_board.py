@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -21,9 +22,130 @@ from .quotes import get_quote
 from .session import is_live_data_window, live_data_window_label
 from .universe import UNIVERSE
 
-_BOARD_CACHE: dict[str, Any] = {"ts": 0.0, "payload": None, "prevWing": None, "prevSpot": None}
+_BOARD_CACHE: dict[str, Any] = {
+    "ts": 0.0,
+    "payload": None,
+    "prevWing": None,
+    "prevSpot": None,
+    "building": False,
+    "lastError": None,
+}
+_BOARD_LOCK = threading.Lock()
+_BOARD_DONE = threading.Event()
 _BOARD_TTL_S = 30.0
 _BOARD_TTL_CLOSED_S = 15 * 60.0  # after close, reuse last board — no live churn
+
+
+def _empty_nifty_board(*, error: str | None = None) -> dict[str, Any]:
+    """Paint-able shell while the first Yahoo/Fyers/Gemini build runs on Render."""
+    in_hours = is_live_data_window()
+    msg = error or "Market board warming up — first load on free hosting can take 1–2 min."
+    return {
+        "asOf": datetime.now(timezone.utc).isoformat(),
+        "fyersConnected": bool(fyers_status(verify=False).get("connected")),
+        "marketHours": in_hours,
+        "marketHoursLabel": live_data_window_label(),
+        "liveDataPaused": not in_hours,
+        "index": {"ready": False, "ltp": None, "changePct": None, "source": None},
+        "breadth": {"ready": False, "segments": []},
+        "breadthHistory": breadth_history(5),
+        "drivers": {"topUp": [], "topDown": []},
+        "leadLag": {"ready": False, "label": "Waiting for quotes", "verdict": "—"},
+        "futures": {"ready": False},
+        "stockFutBasket": {"ready": False},
+        "marketSync": {"ready": False},
+        "pcr": {"ready": False},
+        "pcrHistory": pcr_history(10),
+        "optionOi": {"ready": False, "plot": [], "rows": []},
+        "oiInsight": {"headline": msg, "bullets": [], "source": "system"},
+        "insights": [msg],
+        "paperTrades": None,
+        "cached": False,
+        "stale": True,
+        "building": True,
+        "error": error,
+    }
+
+
+def _store_nifty_board(payload: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(payload)
+    payload["cached"] = False
+    payload["stale"] = False
+    payload["building"] = False
+    payload.pop("error", None)
+    _BOARD_CACHE["ts"] = time.time()
+    _BOARD_CACHE["payload"] = payload
+    _BOARD_CACHE["lastError"] = None
+    _BOARD_DONE.set()
+    return payload
+
+
+def _rebuild_nifty_board_bg(*, force: bool = False) -> None:
+    with _BOARD_LOCK:
+        if _BOARD_CACHE["building"]:
+            return
+        _BOARD_CACHE["building"] = True
+        _BOARD_DONE.clear()
+    try:
+        payload = _build_nifty_board_full(force=force)
+        _store_nifty_board(payload)
+    except Exception as exc:  # noqa: BLE001
+        _BOARD_CACHE["lastError"] = f"{type(exc).__name__}: {exc}"
+        _BOARD_DONE.set()
+    finally:
+        with _BOARD_LOCK:
+            _BOARD_CACHE["building"] = False
+        _BOARD_DONE.set()
+
+
+def _kick_rebuild(*, force: bool = False) -> None:
+    threading.Thread(
+        target=_rebuild_nifty_board_bg,
+        kwargs={"force": force},
+        daemon=True,
+        name="saint-nifty-rebuild",
+    ).start()
+
+
+def get_nifty_board(*, force: bool = False) -> dict[str, Any]:
+    """Serve cached board instantly; never block HTTP on a cold Yahoo/Fyers rebuild."""
+    now = time.time()
+    in_hours = is_live_data_window()
+    ttl = _BOARD_TTL_S if in_hours else _BOARD_TTL_CLOSED_S
+    cached = _BOARD_CACHE.get("payload")
+    age = now - float(_BOARD_CACHE["ts"]) if cached is not None else None
+
+    if cached is not None:
+        out = dict(cached)
+        out["cached"] = True
+        out["cacheAgeS"] = round(float(age or 0), 1)
+        stale = bool(age is not None and age >= ttl)
+        out["stale"] = stale or force
+        out["building"] = bool(_BOARD_CACHE.get("building"))
+        out["marketHours"] = in_hours
+        out["marketHoursLabel"] = live_data_window_label()
+        out["liveDataPaused"] = not in_hours
+        if out.get("error"):
+            out["error"] = _BOARD_CACHE.get("lastError")
+        if force or stale:
+            _kick_rebuild(force=force)
+        return out
+
+    # After close: reuse last snapshot if we have one.
+    if not in_hours and cached is not None and not force:
+        out = dict(cached)
+        out["cached"] = True
+        out["marketHours"] = False
+        out["marketHoursLabel"] = live_data_window_label()
+        out["liveDataPaused"] = True
+        out["building"] = False
+        out["stale"] = False
+        return out
+
+    _kick_rebuild(force=force)
+    empty = _empty_nifty_board(error=_BOARD_CACHE.get("lastError"))
+    empty["building"] = bool(_BOARD_CACHE.get("building"))
+    return empty
 
 
 def _index_quote() -> dict[str, Any]:
@@ -123,30 +245,12 @@ def _lead_lag(
 
 
 def build_nifty_board(*, force: bool = False) -> dict[str, Any]:
-    now = time.time()
+    """Backward-compatible alias — prefer get_nifty_board for HTTP handlers."""
+    return get_nifty_board(force=force)
+
+
+def _build_nifty_board_full(*, force: bool = False) -> dict[str, Any]:
     in_hours = is_live_data_window()
-    ttl = _BOARD_TTL_S if in_hours else _BOARD_TTL_CLOSED_S
-
-    if (
-        not force
-        and _BOARD_CACHE["payload"] is not None
-        and now - float(_BOARD_CACHE["ts"]) < ttl
-    ):
-        out = dict(_BOARD_CACHE["payload"])
-        out["cached"] = True
-        out["marketHours"] = in_hours
-        out["marketHoursLabel"] = live_data_window_label()
-        out["liveDataPaused"] = not in_hours
-        return out
-
-    # After close / before open: serve last snapshot if we have one (no Fyers / Gemini).
-    if not in_hours and _BOARD_CACHE["payload"] is not None and not force:
-        out = dict(_BOARD_CACHE["payload"])
-        out["cached"] = True
-        out["marketHours"] = False
-        out["marketHoursLabel"] = live_data_window_label()
-        out["liveDataPaused"] = True
-        return out
 
     weight_pack = get_nifty_weights()
     symbols = [s for s in (weight_pack.get("weights") or {}) if s in UNIVERSE]
@@ -366,8 +470,6 @@ def build_nifty_board(*, force: bool = False) -> dict[str, Any]:
         "cached": False,
     }
 
-    _BOARD_CACHE["ts"] = now
-    _BOARD_CACHE["payload"] = payload
     _BOARD_CACHE["prevWing"] = wing
     _BOARD_CACHE["prevSpot"] = spot
     return payload

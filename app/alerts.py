@@ -495,12 +495,13 @@ def run_alert_tick(*, force_dashboard: bool = False) -> dict[str, Any]:
 
     def _nifty_paper_side() -> dict[str, Any] | None:
         try:
-            from .nifty_board import build_nifty_board
+            from .nifty_board import _build_nifty_board_full, _store_nifty_board
             from .session import is_live_data_window
 
             if not (is_live_data_window() or force_dashboard):
                 return {"ok": True, "skipped": "outside_hours"}
-            board = build_nifty_board(force=False)
+            board = _build_nifty_board_full(force=False)
+            _store_nifty_board(board)
             pt = board.get("paperTrades") if isinstance(board, dict) else None
             if isinstance(pt, dict):
                 return {
