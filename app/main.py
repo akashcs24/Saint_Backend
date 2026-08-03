@@ -185,11 +185,14 @@ def nifty_board(force: bool = Query(False)):
 
 
 @app.get("/api/nifty/paper-trades")
-def nifty_paper_trades(limit: int = Query(40, ge=1, le=200)):
+def nifty_paper_trades(limit: int = Query(40, ge=1, le=200), evaluate: bool = Query(False)):
     """List paper trades bucketed by strategy (decline, tsl, …)."""
     try:
-        from .nifty_paper_trades import paper_trades_board
+        from .nifty_paper_trades import paper_trades_board, tick_paper_trades
+        from .session import is_live_data_window
 
+        if evaluate and is_live_data_window() and get_access_token():
+            tick_paper_trades(force=False)
         return paper_trades_board(limit_per=limit)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc

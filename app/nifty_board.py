@@ -34,6 +34,7 @@ _BOARD_LOCK = threading.Lock()
 _BOARD_DONE = threading.Event()
 _BOARD_TTL_S = 30.0
 _BOARD_LIVE_TTL_S = 1.0  # Fyers breadth/spot slice when poller is running
+_BOARD_PAPER_TICK_S = 60.0  # evaluate paper books during live refresh
 _BOARD_TTL_CLOSED_S = 15 * 60.0  # after close, reuse last board — no live churn
 
 
@@ -109,6 +110,27 @@ def _kick_rebuild(*, force: bool = False) -> None:
     ).start()
 
 
+def _maybe_run_paper_tick(market_sync: dict[str, Any]) -> dict[str, Any] | None:
+    """Best-effort paper evaluation during live hours (throttled)."""
+    if not is_live_data_window() or not get_access_token():
+        return None
+    now = time.time()
+    last = float(_BOARD_CACHE.get("paper_tick_ts") or 0)
+    if now - last < _BOARD_PAPER_TICK_S:
+        return _BOARD_CACHE.get("last_paper_tick")  # type: ignore[return-value]
+    try:
+        from .nifty_paper_trades import tick_paper_trades
+
+        cross = (market_sync.get("cross") or {}).get("diffPp")
+        cross_pp = float(cross) if cross is not None else None
+        pt = tick_paper_trades(force=False, cross_diff_pp=cross_pp)
+        _BOARD_CACHE["paper_tick_ts"] = now
+        _BOARD_CACHE["last_paper_tick"] = pt
+        return pt
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _refresh_live_slice(payload: dict[str, Any]) -> dict[str, Any]:
     """Fast path: refresh Fyers-driven breadth/spot/sync without OI/AI/chain."""
     weight_pack = get_nifty_weights()
@@ -145,6 +167,18 @@ def _refresh_live_slice(payload: dict[str, Any]) -> dict[str, Any]:
     )
     lead["syncInsight"] = market_sync.get("insight") or sync_insight
     lead["marketSync"] = market_sync
+
+    record_breadth_snapshot(
+        {
+            "weightUp": breadth.get("weightUp"),
+            "weightDown": breadth.get("weightDown"),
+            "weightFlat": breadth.get("weightFlat"),
+            "contributionPct": breadth.get("contributionPct"),
+            "advances": breadth.get("advances"),
+            "declines": breadth.get("declines"),
+            "lean": breadth.get("lean"),
+        }
+    )
 
     segments = list(breadth.get("segments") or [])
     ups = sorted(
@@ -185,6 +219,9 @@ def _refresh_live_slice(payload: dict[str, Any]) -> dict[str, Any]:
     out["liveRefresh"] = True
     out["cached"] = True
     out["stale"] = False
+    paper_tick = _maybe_run_paper_tick(market_sync)
+    if paper_tick:
+        out["paperTrades"] = paper_tick
     _BOARD_CACHE["payload"] = out
     _BOARD_CACHE["ts"] = time.time()
     return out

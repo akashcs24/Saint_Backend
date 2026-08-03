@@ -483,13 +483,41 @@ def paper_trade_summary(strategy_id: str = "decline") -> dict[str, Any]:
     return _summary_for(strategy_id, trades)
 
 
+def paper_entry_signal() -> dict[str, Any]:
+    """Explain why decline/tsl did or did not enter (5m weightUp streaks)."""
+    rows = _chrono_weight_up(8)
+    vals = [float(r["weightUp"]) for r in rows]
+    rising = _rising_streak(vals, ENTRY_RISE_BARS)
+    falling = _falling_streak(vals, EXIT_DECLINE_BARS)
+    if rising:
+        hint = "Entry gate open — three consecutive 5m weightUp increases."
+    elif len(vals) < ENTRY_RISE_BARS + 1:
+        need = ENTRY_RISE_BARS + 1 - len(vals)
+        hint = f"Collecting history — need {need} more 5m snapshot(s) for a rising ×3 streak."
+    else:
+        hint = (
+            "Waiting for 3 straight 5m weightUp increases. "
+            "Bullish adv/dec alone does not enter — weightUp must keep rising each 5m bar."
+        )
+    return {
+        "weightUpSeries": vals,
+        "bucketLabels": [r.get("t") for r in rows],
+        "rising3": rising,
+        "falling4": falling,
+        "entryHint": hint,
+        "barTf": "5m",
+    }
+
+
 def paper_trades_board(
     limit_per: int = 40, *, mark_ltp: float | None = None
 ) -> dict[str, Any]:
     with _lock:
         con = _conn()
         try:
-            return _board_unlocked(con, limit_per, mark_ltp=mark_ltp)
+            board = _board_unlocked(con, limit_per, mark_ltp=mark_ltp)
+            board["signal"] = paper_entry_signal()
+            return board
         finally:
             con.close()
 
