@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .fyers_auth import get_access_token
 from .fyers_quotes import fetch_fyers_quotes
+from .market_minute_store import record_constituent_quotes
 from .nifty_pcr import fetch_nifty_pcr
 from .nifty_weights import get_nifty_weights
 from .quotes import get_quote
@@ -22,9 +23,18 @@ _FLAT_PCT = 0.05
 # Weight-weighted contribution thresholds for a directional lean.
 _LEAN_PCT = 0.12
 _WEIGHT_TREND_EPS = 1.0  # percentage points of decline-weight
-_BREADTH_CACHE: dict = {"ts": 0.0, "payload": None}
+_BREADTH_CACHES: dict[str, dict] = {
+    "nifty": {"ts": 0.0, "payload": None},
+    "sensex": {"ts": 0.0, "payload": None},
+}
 _BREADTH_TTL_S = 90.0  # reuse breadth board across dashboard rebuilds (Yahoo)
 _BREADTH_TTL_FYERS_S = 1.0  # live poller refreshes quotes every ~1s per batch
+
+
+def _breadth_cache(key: str) -> dict:
+    if key not in _BREADTH_CACHES:
+        _BREADTH_CACHES[key] = {"ts": 0.0, "payload": None}
+    return _BREADTH_CACHES[key]
 
 
 def _breadth_ttl_s() -> float:
@@ -43,20 +53,60 @@ def _side(change_pct: float) -> str:
 
 def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
     """Advance/decline + weight-weighted Nifty lean from constituent quotes."""
+    return build_constituent_breadth(
+        get_nifty_weights(),
+        cache_key="nifty",
+        index_label="Nifty",
+        include_pcr=True,
+        weight_down_trend_key="nifty_weight_down",
+        weight_up_trend_key="nifty_weight_up",
+        max_workers=max_workers,
+        force=force,
+    )
+
+
+def build_sensex_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
+    """Advance/decline + weight-weighted Sensex lean from constituent quotes."""
+    from .sensex_weights import get_sensex_weights
+
+    return build_constituent_breadth(
+        get_sensex_weights(),
+        cache_key="sensex",
+        index_label="Sensex",
+        include_pcr=False,
+        weight_down_trend_key="sensex_weight_down",
+        weight_up_trend_key="sensex_weight_up",
+        max_workers=max_workers,
+        force=force,
+    )
+
+
+def build_constituent_breadth(
+    weight_pack: dict,
+    *,
+    cache_key: str = "nifty",
+    index_label: str = "Nifty",
+    include_pcr: bool = True,
+    weight_down_trend_key: str = "nifty_weight_down",
+    weight_up_trend_key: str = "nifty_weight_up",
+    max_workers: int = 12,
+    force: bool = False,
+) -> dict:
+    """Advance/decline + weight-weighted index lean from constituent quotes."""
     import time
 
+    cache = _breadth_cache(cache_key)
     now = time.time()
     ttl = _breadth_ttl_s()
     if (
         not force
-        and _BREADTH_CACHE["payload"] is not None
-        and now - float(_BREADTH_CACHE["ts"]) < ttl
+        and cache["payload"] is not None
+        and now - float(cache["ts"]) < ttl
     ):
-        out = dict(_BREADTH_CACHE["payload"])
+        out = dict(cache["payload"])
         out["cached"] = True
         return out
 
-    weight_pack = get_nifty_weights()
     nifty_weights: dict[str, float] = weight_pack.get("weights") or {}
     symbols = [s for s in nifty_weights if s in UNIVERSE]
     quotes: dict[str, object] = {}
@@ -88,7 +138,7 @@ def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
         if quote_source == "fyers" and missing:
             quote_source = "fyers+yahoo"
 
-    pcr = fetch_nifty_pcr()
+    pcr = fetch_nifty_pcr() if include_pcr else None
     weights_meta = {
         "source": weight_pack.get("source"),
         "count": weight_pack.get("count"),
@@ -96,6 +146,13 @@ def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
         "unmapped": weight_pack.get("unmapped") or [],
         "quoteSource": quote_source,
     }
+
+    # Persist the exact quote stream used for breadth so history + storage stay aligned.
+    if quotes:
+        try:
+            record_constituent_quotes(cache_key, quotes)
+        except Exception:  # noqa: BLE001
+            pass
 
     if not quotes:
         return {
@@ -186,7 +243,7 @@ def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
         label = "More declines by weight — soft down lean"
     else:
         lean, action = "mixed", "watch"
-        label = "Breadth mixed — no clear Nifty lean"
+        label = f"Breadth mixed — no clear {index_label} lean"
 
     top_up = [
         {"symbol": s, "changePct": round(c, 2), "weight": round(w, 2), "contributionPct": round(x, 3)}
@@ -218,11 +275,11 @@ def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
     # Decline-weight trend: arrow up = more weight declining (pressure rising).
     w_down_r = round(weight_down, 1)
     w_up_r = round(weight_up, 1)
-    record_trend("nifty_weight_down", w_down_r)
-    record_trend("nifty_weight_up", w_up_r)
+    record_trend(weight_down_trend_key, w_down_r)
+    record_trend(weight_up_trend_key, w_up_r)
     weight_trend = {
-        "down": trend_pair("nifty_weight_down", current=w_down_r, eps=_WEIGHT_TREND_EPS),
-        "up": trend_pair("nifty_weight_up", current=w_up_r, eps=_WEIGHT_TREND_EPS),
+        "down": trend_pair(weight_down_trend_key, current=w_down_r, eps=_WEIGHT_TREND_EPS),
+        "up": trend_pair(weight_up_trend_key, current=w_up_r, eps=_WEIGHT_TREND_EPS),
     }
 
     result = {
@@ -248,6 +305,6 @@ def build_nifty_breadth(*, max_workers: int = 12, force: bool = False) -> dict:
         "weightTrend": weight_trend,
         "cached": False,
     }
-    _BREADTH_CACHE["ts"] = time.time()
-    _BREADTH_CACHE["payload"] = result
+    cache["ts"] = time.time()
+    cache["payload"] = result
     return result

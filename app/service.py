@@ -21,6 +21,7 @@ from .tape import (
 from .action_confirm import apply_action_confirmation
 from .macro import build_macro_cards
 from .model_sentiment import blend_company_sentiment, finbert_enabled, score_headlines
+from .news_state import news_fetch_enabled
 from .nifty_breadth import build_nifty_breadth
 from .news import fetch_news, news_for_symbol
 from .predictions import (
@@ -727,9 +728,10 @@ def _enrich_session_row(row: dict) -> dict | None:
 
 
 def build_dashboard() -> dict:
-    news = fetch_news()
+    news_enabled = news_fetch_enabled()
+    news = fetch_news() if news_enabled else []
     resolve_due_predictions()
-    if finbert_enabled():
+    if news_enabled and finbert_enabled():
         score_headlines(
             [
                 n.get("headline") or ""
@@ -740,45 +742,47 @@ def build_dashboard() -> dict:
 
     by_sym: dict[str, list[dict]] = defaultdict(list)
     promoted: set[str] = set()
-    for n in news:
-        if n["minutesAgo"] > 60 * 36:
-            continue
-        for link in n.get("links") or []:
-            if not _is_board_worthy(link, n):
+    if news_enabled:
+        for n in news:
+            if n["minutesAgo"] > 60 * 36:
                 continue
-            item = dict(n)
-            item["relevance"] = link["relevance"]
-            item["linkType"] = link["type"]
-            item["linkReason"] = link["reason"]
-            item["expectedDirection"] = link["direction"]
-            by_sym[link["symbol"]].append(item)
-            # Direct always promotes; strong sector/peer also promote.
-            if link["type"] == "direct" or float(link["relevance"]) >= SECTOR_BOARD_MIN:
-                promoted.add(link["symbol"])
+            for link in n.get("links") or []:
+                if not _is_board_worthy(link, n):
+                    continue
+                item = dict(n)
+                item["relevance"] = link["relevance"]
+                item["linkType"] = link["type"]
+                item["linkReason"] = link["reason"]
+                item["expectedDirection"] = link["direction"]
+                by_sym[link["symbol"]].append(item)
+                # Direct always promotes; strong sector/peer also promote.
+                if link["type"] == "direct" or float(link["relevance"]) >= SECTOR_BOARD_MIN:
+                    promoted.add(link["symbol"])
 
     stocks: list[dict] = []
-    for sym in promoted:
-        # Score conviction on the same evidence set as the stock page.
-        # Board-worthiness only decides who appears and which story is shown.
-        row = build_stock_row(sym, related_news=news_for_symbol(sym, news))
-        if not row:
-            continue
-        board_items = by_sym.get(sym) or []
-        if board_items:
-            preferred = [n for n in board_items if not is_hype_event(_event_key(n))]
-            pool = preferred or board_items
-            want = int(row.get("expectedDirection") or 0)
-            if want != 0:
-                aligned = [n for n in pool if int(n.get("expectedDirection") or 0) == want]
-                if aligned:
-                    pool = aligned
-            row["_anchor"] = max(
-                pool,
-                key=lambda n: (_evidence_weight(n), -(n.get("minutesAgo") or 0)),
-            )
-        enriched = _enrich_session_row(row)
-        if enriched:
-            stocks.append(enriched)
+    if news_enabled:
+        for sym in promoted:
+            # Score conviction on the same evidence set as the stock page.
+            # Board-worthiness only decides who appears and which story is shown.
+            row = build_stock_row(sym, related_news=news_for_symbol(sym, news))
+            if not row:
+                continue
+            board_items = by_sym.get(sym) or []
+            if board_items:
+                preferred = [n for n in board_items if not is_hype_event(_event_key(n))]
+                pool = preferred or board_items
+                want = int(row.get("expectedDirection") or 0)
+                if want != 0:
+                    aligned = [n for n in pool if int(n.get("expectedDirection") or 0) == want]
+                    if aligned:
+                        pool = aligned
+                row["_anchor"] = max(
+                    pool,
+                    key=lambda n: (_evidence_weight(n), -(n.get("minutesAgo") or 0)),
+                )
+            enriched = _enrich_session_row(row)
+            if enriched:
+                stocks.append(enriched)
 
     buckets = {
         "next_session": [],
@@ -818,10 +822,10 @@ def build_dashboard() -> dict:
     indices: list = []
     nifty_breadth = None
     macro: list = []
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=3 if news_enabled else 2) as pool:
         fut_idx = pool.submit(get_index_quotes)
         fut_breadth = pool.submit(build_nifty_breadth)
-        fut_macro = pool.submit(build_macro_cards, 3)
+        fut_macro = pool.submit(build_macro_cards, 3) if news_enabled else None
         try:
             indices = fut_idx.result() or []
         except Exception:  # noqa: BLE001
@@ -830,10 +834,11 @@ def build_dashboard() -> dict:
             nifty_breadth = fut_breadth.result()
         except Exception:  # noqa: BLE001
             nifty_breadth = None
-        try:
-            macro = fut_macro.result() or []
-        except Exception:  # noqa: BLE001
-            macro = []
+        if fut_macro is not None:
+            try:
+                macro = fut_macro.result() or []
+            except Exception:  # noqa: BLE001
+                macro = []
 
     def market_relevant(n: dict) -> bool:
         return n.get("scope") != "unclassified"
@@ -853,11 +858,12 @@ def build_dashboard() -> dict:
             seen_ids.add(n["id"])
             mixed.append(n)
 
-    add_all(take(lambda n: n.get("kind") != "tweet" and ("FII" in n.get("tags", []) or "DII" in n.get("tags", [])), 3))
-    add_all(take(lambda n: n.get("kind") != "tweet" and n.get("scope") == "company", 5))
-    add_all(take(lambda n: n.get("kind") != "tweet", 6))
-    add_all(take(lambda n: n.get("kind") == "tweet", 4))
-    add_all(take(lambda _n: True, 12, relevant_only=False))
+    if news_enabled:
+        add_all(take(lambda n: n.get("kind") != "tweet" and ("FII" in n.get("tags", []) or "DII" in n.get("tags", [])), 3))
+        add_all(take(lambda n: n.get("kind") != "tweet" and n.get("scope") == "company", 5))
+        add_all(take(lambda n: n.get("kind") != "tweet", 6))
+        add_all(take(lambda n: n.get("kind") == "tweet", 4))
+        add_all(take(lambda _n: True, 12, relevant_only=False))
     feed = mixed[:12]
     feed.sort(key=lambda n: (n["minutesAgo"], -n["impact"]))
     brief = build_morning_brief(indices, feed, macro)
@@ -910,8 +916,10 @@ def _store_dashboard(payload: dict) -> dict:
     payload["cached"] = False
     payload["stale"] = False
     payload.pop("error", None)
+    payload["newsEnabled"] = bool(news_fetch_enabled())
     _DASH_CACHE["ts"] = time.time()
     _DASH_CACHE["payload"] = payload
+    _DASH_CACHE["news_enabled"] = bool(payload["newsEnabled"])
     _DASH_CACHE["lastError"] = None
     _DASH_DONE.set()
     return payload
@@ -948,23 +956,30 @@ def get_dashboard(*, force: bool = False) -> dict:
     ttl = float(settings.dashboard_ttl_open_s if is_open_window() else settings.dashboard_ttl_s)
     cached = _DASH_CACHE["payload"]
     age = now - float(_DASH_CACHE["ts"]) if cached is not None else None
+    news_enabled = news_fetch_enabled()
 
     if cached is not None:
-        out = dict(cached)
-        out["cached"] = True
-        out["cacheAgeS"] = round(float(age or 0), 1)
-        stale = bool(age is not None and age >= ttl)
-        out["stale"] = stale or force
-        # Soft path: always return cache; refresh when stale or force.
-        if force or stale:
-            t = __import__("threading").Thread(
-                target=_rebuild_dashboard_bg,
-                kwargs={"force": force},
-                daemon=True,
-                name="saint-dash-rebuild",
-            )
-            t.start()
-        return out
+        cached_mode = bool(_DASH_CACHE.get("news_enabled", True))
+        if cached_mode != news_enabled:
+            _DASH_CACHE["payload"] = None
+            cached = None
+            age = None
+        else:
+            out = dict(cached)
+            out["cached"] = True
+            out["cacheAgeS"] = round(float(age or 0), 1)
+            stale = bool(age is not None and age >= ttl)
+            out["stale"] = stale or force
+            # Soft path: always return cache; refresh when stale or force.
+            if force or stale:
+                t = __import__("threading").Thread(
+                    target=_rebuild_dashboard_bg,
+                    kwargs={"force": force},
+                    daemon=True,
+                    name="saint-dash-rebuild",
+                )
+                t.start()
+            return out
 
     # Cold start — single-flight. Concurrent callers wait instead of double-building
     # (UptimeRobot alert tick + Vercel board used to stampede free Render).
@@ -1020,7 +1035,8 @@ def get_dashboard(*, force: bool = False) -> dict:
 
 def build_stock_detail(symbol: str) -> dict | None:
     sym = symbol.upper()
-    related = news_for_symbol(sym)
+    news_enabled = news_fetch_enabled()
+    related = news_for_symbol(sym, []) if not news_enabled else news_for_symbol(sym)
     row = build_stock_row(sym, related_news=related)
     if not row:
         return None

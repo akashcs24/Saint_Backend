@@ -9,6 +9,7 @@ from typing import Any
 
 from .fyers_auth import get_access_token, fyers_status
 from .fyers_quotes import ensure_fyers_poller, fetch_fyers_quotes
+from .market_minute_store import record_index_quote
 from .nifty_breadth import build_nifty_breadth
 from .nifty_breadth_history import breadth_history, record_breadth_snapshot
 from .nifty_chain import atm_wing_board, enrich_oi_plot, fetch_nifty_option_chain, oi_insights
@@ -19,7 +20,7 @@ from .nifty_pcr_history import pcr_history, record_pcr_snapshot
 from .nifty_stock_fut import build_market_sync_card, build_stock_fut_basket
 from .nifty_weights import get_nifty_weights
 from .quotes import get_quote
-from .session import is_live_data_window, live_data_window_label
+from .session import is_cash_session_open, is_live_data_window, live_data_window_label
 from .universe import UNIVERSE
 
 _BOARD_CACHE: dict[str, Any] = {
@@ -33,12 +34,20 @@ _BOARD_CACHE: dict[str, Any] = {
 _BOARD_LOCK = threading.Lock()
 _BOARD_DONE = threading.Event()
 _BOARD_TTL_S = 30.0
-_BOARD_LIVE_TTL_S = 2.0  # Fyers breadth/spot slice when poller is running
+_BOARD_LIVE_TTL_S = 1.0  # Fyers breadth/spot slice when poller is running
 _BOARD_PAPER_TICK_S = 60.0  # evaluate paper books during live refresh
 _BOARD_TTL_CLOSED_S = 15 * 60.0  # after close, reuse last board — no live churn
 
 
-def _empty_nifty_board(*, error: str | None = None) -> dict[str, Any]:
+def _sanitize_interval(interval: int | None) -> int:
+    return 1 if int(interval or 5) == 1 else 5
+
+
+def _sanitize_rows(rows: int | None) -> int:
+    return max(3, min(int(rows or 5), 500))
+
+
+def _empty_nifty_board(*, error: str | None = None, breadth_interval: int = 5, breadth_rows: int = 5) -> dict[str, Any]:
     """Paint-able shell while the first Yahoo/Fyers/Gemini build runs on Render."""
     in_hours = is_live_data_window()
     msg = error or "Market board warming up — first load on free hosting can take 1–2 min."
@@ -50,7 +59,9 @@ def _empty_nifty_board(*, error: str | None = None) -> dict[str, Any]:
         "liveDataPaused": not in_hours,
         "index": {"ready": False, "ltp": None, "changePct": None, "source": None},
         "breadth": {"ready": False, "segments": []},
-        "breadthHistory": breadth_history(5),
+        "breadthIntervalMin": breadth_interval,
+        "breadthRows": breadth_rows,
+        "breadthHistory": breadth_history(breadth_rows, interval_minutes=breadth_interval),
         "drivers": {"topUp": [], "topDown": []},
         "leadLag": {"ready": False, "label": "Waiting for quotes", "verdict": "—"},
         "futures": {"ready": False},
@@ -83,14 +94,23 @@ def _store_nifty_board(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _rebuild_nifty_board_bg(*, force: bool = False) -> None:
+def _rebuild_nifty_board_bg(
+    *,
+    force: bool = False,
+    breadth_interval: int = 5,
+    breadth_rows: int = 5,
+) -> None:
     with _BOARD_LOCK:
         if _BOARD_CACHE["building"]:
             return
         _BOARD_CACHE["building"] = True
         _BOARD_DONE.clear()
     try:
-        payload = _build_nifty_board_full(force=force)
+        payload = _build_nifty_board_full(
+            force=force,
+            breadth_interval=breadth_interval,
+            breadth_rows=breadth_rows,
+        )
         _store_nifty_board(payload)
     except Exception as exc:  # noqa: BLE001
         _BOARD_CACHE["lastError"] = f"{type(exc).__name__}: {exc}"
@@ -101,10 +121,19 @@ def _rebuild_nifty_board_bg(*, force: bool = False) -> None:
         _BOARD_DONE.set()
 
 
-def _kick_rebuild(*, force: bool = False) -> None:
+def _kick_rebuild(
+    *,
+    force: bool = False,
+    breadth_interval: int = 5,
+    breadth_rows: int = 5,
+) -> None:
     threading.Thread(
         target=_rebuild_nifty_board_bg,
-        kwargs={"force": force},
+        kwargs={
+            "force": force,
+            "breadth_interval": breadth_interval,
+            "breadth_rows": breadth_rows,
+        },
         daemon=True,
         name="saint-nifty-rebuild",
     ).start()
@@ -131,7 +160,12 @@ def _maybe_run_paper_tick(market_sync: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
-def _refresh_live_slice(payload: dict[str, Any]) -> dict[str, Any]:
+def _refresh_live_slice(
+    payload: dict[str, Any],
+    *,
+    breadth_interval: int = 5,
+    breadth_rows: int = 5,
+) -> dict[str, Any]:
     """Fast path: refresh Fyers-driven breadth/spot/sync without OI/AI/chain."""
     weight_pack = get_nifty_weights()
     symbols = [s for s in (weight_pack.get("weights") or {}) if s in UNIVERSE]
@@ -168,17 +202,22 @@ def _refresh_live_slice(payload: dict[str, Any]) -> dict[str, Any]:
     lead["syncInsight"] = market_sync.get("insight") or sync_insight
     lead["marketSync"] = market_sync
 
-    record_breadth_snapshot(
-        {
-            "weightUp": breadth.get("weightUp"),
-            "weightDown": breadth.get("weightDown"),
-            "weightFlat": breadth.get("weightFlat"),
-            "contributionPct": breadth.get("contributionPct"),
-            "advances": breadth.get("advances"),
-            "declines": breadth.get("declines"),
-            "lean": breadth.get("lean"),
-        }
-    )
+    if is_cash_session_open():
+        br_hist = record_breadth_snapshot(
+            {
+                "weightUp": breadth.get("weightUp"),
+                "weightDown": breadth.get("weightDown"),
+                "weightFlat": breadth.get("weightFlat"),
+                "contributionPct": breadth.get("contributionPct"),
+                "advances": breadth.get("advances"),
+                "declines": breadth.get("declines"),
+                "lean": breadth.get("lean"),
+            },
+            limit=breadth_rows,
+            interval_minutes=breadth_interval,
+        )
+    else:
+        br_hist = breadth_history(breadth_rows, interval_minutes=breadth_interval)
 
     segments = list(breadth.get("segments") or [])
     ups = sorted(
@@ -213,6 +252,12 @@ def _refresh_live_slice(payload: dict[str, Any]) -> dict[str, Any]:
         "segments": segments,
         "weightTrend": breadth.get("weightTrend"),
     }
+    out["breadthIntervalMin"] = breadth_interval
+    out["breadthRows"] = breadth_rows
+    out["breadthHistory"] = br_hist or breadth_history(
+        breadth_rows,
+        interval_minutes=breadth_interval,
+    )
     out["drivers"] = {"topUp": ups[:10], "topDown": downs[:10]}
     out["leadLag"] = lead
     out["marketSync"] = market_sync
@@ -227,8 +272,15 @@ def _refresh_live_slice(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def get_nifty_board(*, force: bool = False) -> dict[str, Any]:
+def get_nifty_board(
+    *,
+    force: bool = False,
+    breadth_interval: int = 5,
+    breadth_rows: int = 5,
+) -> dict[str, Any]:
     """Serve cached board instantly; never block HTTP on a cold Yahoo/Fyers rebuild."""
+    interval = _sanitize_interval(breadth_interval)
+    rows = _sanitize_rows(breadth_rows)
     now = time.time()
     in_hours = is_live_data_window()
     ttl = _BOARD_TTL_S if in_hours else _BOARD_TTL_CLOSED_S
@@ -241,14 +293,24 @@ def get_nifty_board(*, force: bool = False) -> dict[str, Any]:
         heavy_age = now - heavy_ts
 
         if fyers_live and age is not None and age >= _BOARD_LIVE_TTL_S and not force:
-            out = _refresh_live_slice(dict(cached))
+            out = _refresh_live_slice(
+                dict(cached),
+                breadth_interval=interval,
+                breadth_rows=rows,
+            )
             out["cacheAgeS"] = 0.0
             out["building"] = bool(_BOARD_CACHE.get("building"))
             out["marketHours"] = in_hours
             out["marketHoursLabel"] = live_data_window_label()
             out["liveDataPaused"] = False
+            out["breadthIntervalMin"] = interval
+            out["breadthRows"] = rows
             if heavy_age >= _BOARD_TTL_S:
-                _kick_rebuild(force=False)
+                _kick_rebuild(
+                    force=False,
+                    breadth_interval=interval,
+                    breadth_rows=rows,
+                )
             return out
 
         out = dict(cached)
@@ -260,10 +322,17 @@ def get_nifty_board(*, force: bool = False) -> dict[str, Any]:
         out["marketHours"] = in_hours
         out["marketHoursLabel"] = live_data_window_label()
         out["liveDataPaused"] = not in_hours
+        out["breadthIntervalMin"] = interval
+        out["breadthRows"] = rows
+        out["breadthHistory"] = breadth_history(rows, interval_minutes=interval)
         if out.get("error"):
             out["error"] = _BOARD_CACHE.get("lastError")
         if force or stale:
-            _kick_rebuild(force=force)
+            _kick_rebuild(
+                force=force,
+                breadth_interval=interval,
+                breadth_rows=rows,
+            )
         return out
 
     # After close: reuse last snapshot if we have one.
@@ -277,8 +346,16 @@ def get_nifty_board(*, force: bool = False) -> dict[str, Any]:
         out["stale"] = False
         return out
 
-    _kick_rebuild(force=force)
-    empty = _empty_nifty_board(error=_BOARD_CACHE.get("lastError"))
+    _kick_rebuild(
+        force=force,
+        breadth_interval=interval,
+        breadth_rows=rows,
+    )
+    empty = _empty_nifty_board(
+        error=_BOARD_CACHE.get("lastError"),
+        breadth_interval=interval,
+        breadth_rows=rows,
+    )
     empty["building"] = bool(_BOARD_CACHE.get("building"))
     return empty
 
@@ -287,6 +364,10 @@ def _index_quote() -> dict[str, Any]:
     q = get_quote("NIFTY")
     if not q:
         return {"ready": False, "ltp": None, "changePct": None, "source": None}
+    try:
+        record_index_quote("nifty", q)
+    except Exception:  # noqa: BLE001
+        pass
     return {
         "ready": True,
         "key": "NIFTY",
@@ -384,7 +465,12 @@ def build_nifty_board(*, force: bool = False) -> dict[str, Any]:
     return get_nifty_board(force=force)
 
 
-def _build_nifty_board_full(*, force: bool = False) -> dict[str, Any]:
+def _build_nifty_board_full(
+    *,
+    force: bool = False,
+    breadth_interval: int = 5,
+    breadth_rows: int = 5,
+) -> dict[str, Any]:
     in_hours = is_live_data_window()
 
     weight_pack = get_nifty_weights()
@@ -478,17 +564,22 @@ def _build_nifty_board_full(*, force: bool = False) -> dict[str, Any]:
         }
     )
 
-    br_hist = record_breadth_snapshot(
-        {
-            "weightUp": breadth.get("weightUp"),
-            "weightDown": breadth.get("weightDown"),
-            "weightFlat": breadth.get("weightFlat"),
-            "contributionPct": breadth.get("contributionPct"),
-            "advances": breadth.get("advances"),
-            "declines": breadth.get("declines"),
-            "lean": breadth.get("lean"),
-        }
-    )
+    if is_cash_session_open():
+        br_hist = record_breadth_snapshot(
+            {
+                "weightUp": breadth.get("weightUp"),
+                "weightDown": breadth.get("weightDown"),
+                "weightFlat": breadth.get("weightFlat"),
+                "contributionPct": breadth.get("contributionPct"),
+                "advances": breadth.get("advances"),
+                "declines": breadth.get("declines"),
+                "lean": breadth.get("lean"),
+            },
+            limit=breadth_rows,
+            interval_minutes=breadth_interval,
+        )
+    else:
+        br_hist = breadth_history(breadth_rows, interval_minutes=breadth_interval)
 
     lead = _lead_lag(breadth, index, spot=float(spot) if spot is not None else None)
     futures = fetch_nifty_futures(spot=float(spot) if spot is not None else None, force=force)
@@ -569,7 +660,9 @@ def _build_nifty_board_full(*, force: bool = False) -> dict[str, Any]:
             "segments": segments,
             "weightTrend": breadth.get("weightTrend"),
         },
-        "breadthHistory": br_hist or breadth_history(5),
+        "breadthIntervalMin": breadth_interval,
+        "breadthRows": breadth_rows,
+        "breadthHistory": br_hist or breadth_history(breadth_rows, interval_minutes=breadth_interval),
         "drivers": {
             "topUp": ups[:10],
             "topDown": downs[:10],

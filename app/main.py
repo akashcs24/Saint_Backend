@@ -11,6 +11,7 @@ from .fyers_auth import (
     clear_access_token,
     exchange_auth_code,
     fyers_configured,
+    fyers_diagnostics,
     fyers_status,
     get_access_token,
 )
@@ -25,6 +26,7 @@ def _startup_fyers_poller() -> None:
     """Warm Fyers batch poller when a token is already on disk."""
     try:
         from .fyers_quotes import ensure_fyers_poller
+        from .market_minute_worker import ensure_market_minute_worker
         from .nifty_weights import get_nifty_weights
         from .universe import UNIVERSE
 
@@ -32,6 +34,8 @@ def _startup_fyers_poller() -> None:
             weights = get_nifty_weights().get("weights") or {}
             symbols = [s for s in weights if s in UNIVERSE]
             ensure_fyers_poller(symbols)
+        # Always run minute worker: it uses Fyers first and Yahoo fallback.
+        ensure_market_minute_worker()
     except Exception:  # noqa: BLE001
         pass
 
@@ -127,10 +131,47 @@ class FyersExchangeBody(BaseModel):
     code: str = Field(..., min_length=1, description="Auth code or full redirect URL")
 
 
+class NiftyPaperTradeImportRow(BaseModel):
+    strategyId: str
+    status: str
+    symbol: str
+    entryTs: str
+    entryPx: float
+    side: str | None = "CE"
+    strike: float | None = None
+    expiry: str | None = None
+    lot: int | None = 65
+    entrySpot: float | None = None
+    entryWeightUp: float | None = None
+    entryReason: str | None = None
+    exitTs: str | None = None
+    exitPx: float | None = None
+    exitSpot: float | None = None
+    exitWeightUp: float | None = None
+    exitReason: str | None = None
+    peakPx: float | None = None
+    pnlRs: float | None = None
+    pnlPct: float | None = None
+
+
+class NiftyPaperTradeImportBody(BaseModel):
+    rows: list[NiftyPaperTradeImportRow] = Field(default_factory=list)
+
+
+class NewsFeedSettingsBody(BaseModel):
+    enabled: bool
+
+
 @app.get("/api/fyers/status")
 def api_fyers_status(force: bool = Query(False)):
     """Live Fyers status. Green only after a successful quote probe (not stale token file)."""
     return fyers_status(verify=True, force_verify=force)
+
+
+@app.get("/api/fyers/debug")
+def api_fyers_debug(force: bool = Query(False)):
+    """Detailed Fyers diagnostics for deployed troubleshooting."""
+    return fyers_diagnostics(force_verify=force)
 
 
 @app.get("/api/fyers/auth-url")
@@ -171,21 +212,100 @@ def dashboard(force: bool = Query(False)):
         return _empty_dashboard(error=f"{type(exc).__name__}: {exc}")
 
 
+@app.get("/api/news/settings")
+def api_news_settings():
+    from .news_state import news_fetch_enabled
+
+    return {"enabled": news_fetch_enabled()}
+
+
+@app.post("/api/news/settings")
+def api_news_settings_update(body: NewsFeedSettingsBody):
+    from .news_state import set_news_fetch_enabled
+
+    return {"enabled": set_news_fetch_enabled(body.enabled)}
+
+
+@app.get("/api/sensex")
+def sensex_board(
+    force: bool = Query(False),
+    breadth_interval: int = Query(5, ge=1, le=5),
+    breadth_rows: int = Query(5, ge=3, le=500),
+):
+    """Sensex 30 page: index, breadth, drivers, basket lead/lag."""
+    try:
+        from .sensex_board import get_sensex_board
+
+        return get_sensex_board(
+            force=force,
+            breadth_interval=breadth_interval,
+            breadth_rows=breadth_rows,
+        )
+    except Exception as exc:  # noqa: BLE001
+        from .sensex_board import _empty_sensex_board
+
+        return _empty_sensex_board(error=f"{type(exc).__name__}: {exc}")
+
+
 @app.get("/api/nifty")
-def nifty_board(force: bool = Query(False)):
+def nifty_board(
+    force: bool = Query(False),
+    breadth_interval: int = Query(5, ge=1, le=5),
+    breadth_rows: int = Query(5, ge=3, le=500),
+):
     """Nifty 50 page: index, breadth, drivers, OI wings, PCR history, lead/lag."""
     try:
         from .nifty_board import get_nifty_board
 
-        return get_nifty_board(force=force)
+        return get_nifty_board(
+            force=force,
+            breadth_interval=breadth_interval,
+            breadth_rows=breadth_rows,
+        )
     except Exception as exc:  # noqa: BLE001
         from .nifty_board import _empty_nifty_board
 
         return _empty_nifty_board(error=f"{type(exc).__name__}: {exc}")
 
 
+@app.get("/api/data/inventory")
+def data_inventory():
+    """Inventory view for index/stock/history data coverage used by Data tab."""
+    try:
+        from .data_inventory import get_data_inventory
+
+        return get_data_inventory()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+
+@app.post("/api/data/sync")
+def data_sync(
+    include_index: bool = Query(True),
+    include_stocks: bool = Query(True),
+    stock_cursor: int = Query(0, ge=0),
+    stock_batch_size: int = Query(20, ge=1, le=50),
+):
+    """Batch sync index + constituents OHLCV from Fyers for Data tab stores."""
+    try:
+        from .data_sync import sync_market_data_batch
+
+        return sync_market_data_batch(
+            include_index=include_index,
+            include_stocks=include_stocks,
+            stock_cursor=stock_cursor,
+            stock_batch_size=stock_batch_size,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+
 @app.get("/api/nifty/paper-trades")
-def nifty_paper_trades(limit: int = Query(40, ge=1, le=200), evaluate: bool = Query(False)):
+def nifty_paper_trades(
+    limit: int = Query(40, ge=1, le=200),
+    evaluate: bool = Query(False),
+    side: str = Query("long", pattern="^(long|short)$"),
+):
     """List paper trades bucketed by strategy (decline, tsl, …)."""
     try:
         from .nifty_paper_trades import paper_trades_board, tick_paper_trades
@@ -195,18 +315,58 @@ def nifty_paper_trades(limit: int = Query(40, ge=1, le=200), evaluate: bool = Qu
             from .nifty_paper_trades import maybe_evaluate_paper_trades
 
             maybe_evaluate_paper_trades()
-        return paper_trades_board(limit_per=limit)
+        return paper_trades_board(limit_per=limit, side=side)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
 @app.post("/api/nifty/paper-trades/tick")
-def nifty_paper_trades_tick(force: bool = Query(True)):
-    """Force-evaluate every paper strategy and capture Fyers ATM CE prices."""
+def nifty_paper_trades_tick(
+    force: bool = Query(True),
+    side: str = Query("long", pattern="^(long|short)$"),
+):
+    """Force-evaluate every paper strategy and capture Fyers ATM option prices."""
     try:
         from .nifty_paper_trades import tick_paper_trades
 
-        return tick_paper_trades(force=force)
+        return tick_paper_trades(force=force, side=side)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+
+@app.post("/api/nifty/paper-trades/import")
+def nifty_paper_trades_import(body: NiftyPaperTradeImportBody):
+    """One-time backfill endpoint for verified historical paper trades."""
+    try:
+        from .nifty_paper_trades import import_historical_trades
+
+        rows = [r.model_dump() for r in body.rows]
+        return import_historical_trades(rows)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+
+@app.post("/api/nifty/paper-trades/backfill")
+def nifty_paper_trades_backfill():
+    """Backfill paper trades from local research outputs and cached option books."""
+    try:
+        from .nifty_paper_backfill import backfill_paper_trades
+
+        return backfill_paper_trades()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+
+@app.post("/api/nifty/options/sync")
+def nifty_option_history_sync(
+    wing: int = Query(10, ge=2, le=20),
+    allow_after_hours: bool = Query(True),
+):
+    """Import project-local Nifty option dumps and forward-fill current symbols through now."""
+    try:
+        from .nifty_option_sync import sync_project_nifty_option_history
+
+        return sync_project_nifty_option_history(wing=wing, allow_after_hours=allow_after_hours)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 

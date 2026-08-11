@@ -30,6 +30,10 @@ _STATE: dict[str, Any] = {
 _PROBE: dict[str, Any] = {"ts": 0.0, "ok": False, "error": None}
 _PROBE_TTL_S = 45.0
 _DOTENV_LOADED = False
+_TOKEN_COLLECTION = "app_auth"
+_TOKEN_DOC_ID = "fyers_access_token"
+_STORAGE_CACHE: dict[str, Any] = {"ts": 0.0, "token": None}
+_STORAGE_CACHE_TTL_S = 15.0
 
 _AUTH_FAIL_MARKERS = (
     "please provide valid token",
@@ -79,6 +83,35 @@ def _env(name: str, default: str = "") -> str:
         or os.getenv(f"SAINT_{name}", "").strip()
         or default
     )
+
+
+def _reset_storage_cache() -> None:
+    _STORAGE_CACHE["ts"] = 0.0
+    _STORAGE_CACHE["token"] = None
+
+
+def _iso_utc(ts: float | int | None) -> str | None:
+    if not ts:
+        return None
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _mongo_token_collection():
+    """Best-effort token collection handle; None when Mongo is unavailable."""
+    try:
+        from .mongo import mongo_db, mongodb_configured
+
+        if not mongodb_configured():
+            return None
+        db = mongo_db()
+        if db is None:
+            return None
+        return db[_TOKEN_COLLECTION]
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def fyers_creds() -> dict[str, str]:
@@ -161,7 +194,26 @@ def _jwt_meta(token: str) -> dict[str, Any]:
 
 
 def _load_token_from_disk() -> str | None:
-    """Prefer fresh token file; ignore expired JWT sitting in .env."""
+    """Load token from Mongo first, then file/env. Results are short-cached."""
+    now = time.time()
+    if now - float(_STORAGE_CACHE.get("ts") or 0.0) < _STORAGE_CACHE_TTL_S:
+        tok = _STORAGE_CACHE.get("token")
+        return str(tok) if tok else None
+
+    token: str | None = None
+
+    # Preferred durable store for deployed backends.
+    col = _mongo_token_collection()
+    if col is not None:
+        try:
+            doc = col.find_one({"_id": _TOKEN_DOC_ID}, {"accessToken": 1}) or {}
+            mtok = (doc.get("accessToken") or "").strip()
+            if mtok and _jwt_unexpired(mtok):
+                token = mtok
+        except Exception:  # noqa: BLE001
+            token = None
+
+    # Fallback local stores.
     path = _token_path()
     file_tok = None
     try:
@@ -171,15 +223,18 @@ def _load_token_from_disk() -> str | None:
     except Exception:  # noqa: BLE001
         file_tok = None
 
-    if file_tok and _jwt_unexpired(file_tok):
-        return file_tok
+    if token is None and file_tok and _jwt_unexpired(file_tok):
+        token = file_tok
 
-    env_tok = _env("FYERS_ACCESS_TOKEN")
-    if env_tok and _jwt_unexpired(env_tok):
-        return env_tok
+    if token is None:
+        env_tok = _env("FYERS_ACCESS_TOKEN")
+        if env_tok and _jwt_unexpired(env_tok):
+            token = env_tok
 
-    # Both missing/expired — do not resurrect a dead .env JWT.
-    return None
+    _STORAGE_CACHE["ts"] = now
+    _STORAGE_CACHE["token"] = token
+    # Missing/expired everywhere — do not resurrect a dead .env JWT.
+    return token
 
 
 def _save_token(token: str) -> None:
@@ -201,6 +256,29 @@ def _save_token(token: str) -> None:
         )
     except Exception:  # noqa: BLE001
         pass
+
+    # Durable store for Render restarts.
+    col = _mongo_token_collection()
+    if col is not None:
+        try:
+            meta = _jwt_meta(token)
+            col.update_one(
+                {"_id": _TOKEN_DOC_ID},
+                {
+                    "$set": {
+                        "accessToken": token,
+                        "savedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "tokenMeta": meta,
+                        "provider": "fyers",
+                    }
+                },
+                upsert=True,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    _STORAGE_CACHE["ts"] = time.time()
+    _STORAGE_CACHE["token"] = token
 
 
 def get_access_token() -> str | None:
@@ -237,6 +315,8 @@ def set_access_token(token: str) -> None:
         _PROBE["ts"] = 0.0
         _PROBE["ok"] = False
         _PROBE["error"] = None
+        _PROBE["lastOkTs"] = None
+        _PROBE["lastFailTs"] = None
     _save_token(token)
     os.environ["FYERS_ACCESS_TOKEN"] = token
 
@@ -250,6 +330,8 @@ def clear_access_token() -> None:
         _PROBE["ts"] = 0.0
         _PROBE["ok"] = False
         _PROBE["error"] = None
+        _PROBE["lastOkTs"] = None
+        _PROBE["lastFailTs"] = None
     os.environ.pop("FYERS_ACCESS_TOKEN", None)
     path = _token_path()
     try:
@@ -257,6 +339,14 @@ def clear_access_token() -> None:
             path.unlink()
     except Exception:  # noqa: BLE001
         pass
+
+    col = _mongo_token_collection()
+    if col is not None:
+        try:
+            col.delete_one({"_id": _TOKEN_DOC_ID})
+        except Exception:  # noqa: BLE001
+            pass
+    _reset_storage_cache()
 
 
 def _resp_text(resp: Any) -> str:
@@ -284,6 +374,7 @@ def mark_token_invalid(reason: str) -> None:
         _PROBE["ts"] = time.time()
         _PROBE["ok"] = False
         _PROBE["error"] = msg
+        _PROBE["lastFailTs"] = _PROBE["ts"]
     os.environ.pop("FYERS_ACCESS_TOKEN", None)
     path = _token_path()
     try:
@@ -292,12 +383,21 @@ def mark_token_invalid(reason: str) -> None:
     except Exception:  # noqa: BLE001
         pass
 
+    col = _mongo_token_collection()
+    if col is not None:
+        try:
+            col.delete_one({"_id": _TOKEN_DOC_ID})
+        except Exception:  # noqa: BLE001
+            pass
+    _reset_storage_cache()
+
 
 def note_fyers_live_ok() -> None:
     with _lock:
         _PROBE["ts"] = time.time()
         _PROBE["ok"] = True
         _PROBE["error"] = None
+        _PROBE["lastOkTs"] = _PROBE["ts"]
         _STATE["lastError"] = None
 
 
@@ -311,6 +411,7 @@ def note_fyers_live_fail(reason: str, *, auth: bool = False) -> None:
         _PROBE["ts"] = time.time()
         _PROBE["ok"] = False
         _PROBE["error"] = msg
+        _PROBE["lastFailTs"] = _PROBE["ts"]
         _STATE["lastError"] = msg
 
 
@@ -335,7 +436,12 @@ def verify_fyers_token(*, force: bool = False) -> bool:
         with _lock:
             if not _STATE.get("revoked"):
                 _STATE["lastError"] = None
-            return bool(_PROBE.get("ok")) and bool(tok)
+            # Presence of a valid token is enough to keep "connected" after-hours;
+            # live quote polling resumes in the next market window.
+            _PROBE["ok"] = bool(tok)
+            _PROBE["error"] = None
+            _PROBE["ts"] = time.time()
+            return bool(tok)
 
     now = time.time()
     with _lock:
@@ -393,6 +499,9 @@ def fyers_status(*, verify: bool = True, force_verify: bool = False) -> dict[str
         if verify and (in_hours or force_verify):
             live = verify_fyers_token(force=force_verify)
             tok = get_access_token()  # may have been cleared on auth fail
+        elif not in_hours:
+            # Keep connected state after-hours when token exists.
+            live = bool(tok)
         else:
             with _lock:
                 live = bool(_PROBE.get("ok")) and bool(tok)
@@ -436,6 +545,21 @@ def fyers_status(*, verify: bool = True, force_verify: bool = False) -> dict[str
             "fyers" if (live and in_hours) else ("fyers(paused)" if live else "yahoo")
         ),
     }
+
+
+def fyers_diagnostics(*, force_verify: bool = False) -> dict[str, Any]:
+    """Detailed probe/debug payload for deployed troubleshooting."""
+    status = fyers_status(verify=True, force_verify=force_verify)
+    with _lock:
+        probe = {
+            "lastProbeTs": _iso_utc(_PROBE.get("ts")),
+            "lastProbeOk": bool(_PROBE.get("ok")),
+            "lastProbeError": _PROBE.get("error"),
+            "lastSuccessTs": _iso_utc(_PROBE.get("lastOkTs")),
+            "lastFailureTs": _iso_utc(_PROBE.get("lastFailTs")),
+            "connectedAt": _iso_utc(_STATE.get("connectedAt")),
+        }
+    return {"status": status, "probe": probe}
 
 
 def auth_login_url() -> str:

@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     # Default: local backend/data/price_cache (Saint-only). For research tapes, set
     # SAINT_PRICE_CACHE to New Folder With Items/data/price_cache in backend/.env.
     price_cache: Path = Path(__file__).resolve().parent.parent / "data" / "price_cache"
+    # Project-owned Nifty option history caches copied from research dumps so
+    # backfills and live server sync don't depend on external folders.
+    nifty_option_1m_dir: Path = Path(__file__).resolve().parent.parent / "data" / "fyers_1m"
+    nifty_option_5m_dir: Path = Path(__file__).resolve().parent.parent / "data" / "fyers_5m"
+    nifty_option_15m_dir: Path = Path(__file__).resolve().parent.parent / "data" / "fyers_fo"
+    # Planned constituent OHLCV caches for data room + backtesting.
+    market_stocks_1m_dir: Path = Path(__file__).resolve().parent.parent / "data" / "market_stocks_1m"
+    market_stocks_5m_dir: Path = Path(__file__).resolve().parent.parent / "data" / "market_stocks_5m"
     # How long (seconds) to cache Yahoo quote snapshots in memory
     quote_ttl_s: int = 120
     # Near cash open (09:15–09:45) we poll quotes much harder for gap validation
@@ -46,7 +54,7 @@ class Settings(BaseSettings):
     # Optional India FinBERT for direct company headlines (off by default)
     use_finbert: bool = False
     # Allow browser calls from the Vite app
-    cors_origins: str = "http://127.0.0.1:3000,http://localhost:3000"
+    cors_origins: str = "http://127.0.0.1:3000,http://localhost:3000,http://127.0.0.1:8080,http://localhost:8080"
     # AI helper provider: gemini (default) | openai
     ai_provider: str = "gemini"
     # Google AI Studio / Gemini API (preferred for freemium)

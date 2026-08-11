@@ -23,10 +23,13 @@ _FYERS_OVERRIDES: dict[str, str] = {
 }
 
 FYERS_BATCH_SIZE = 40
-FYERS_BATCH_INTERVAL_S = 2.0
+FYERS_BATCH_INTERVAL_S = 1.0
+FYERS_MAX_CALLS_PER_MIN = 180
+FYERS_MAX_CALLS_PER_DAY = 9500
 
 _live_cache: dict[str, tuple[float, Quote]] = {}
 _live_lock = threading.Lock()
+_call_times: list[float] = []
 _poller: dict[str, Any] = {
     "thread": None,
     "running": False,
@@ -96,10 +99,38 @@ def _store_live_quotes(quotes: dict[str, Quote]) -> None:
             _live_cache[sym] = (now, q)
 
 
+def _prune_calls(now: float) -> None:
+    global _call_times
+    _call_times = [t for t in _call_times if now - t < 86_400]
+
+
+def _rate_limit_wait_s() -> float:
+    """Respect Fyers ~200/min and ~10k/day caps with headroom."""
+    now = time.time()
+    with _live_lock:
+        _prune_calls(now)
+        minute_calls = sum(1 for t in _call_times if now - t < 60)
+        day_calls = len(_call_times)
+        if day_calls >= FYERS_MAX_CALLS_PER_DAY:
+            return 60.0
+        if minute_calls >= FYERS_MAX_CALLS_PER_MIN:
+            return max(1.0, 60.0 - (now - min(t for t in _call_times if now - t < 60)))
+    return 0.0
+
+
+def _record_call() -> None:
+    with _live_lock:
+        _call_times.append(time.time())
+
+
 def _fetch_fyers_batch(fyers_syms: list[str], fyers_to_saint: dict[str, str]) -> dict[str, Quote]:
     """One Fyers API batch (≤40 symbols)."""
     if not fyers_syms:
         return {}
+    wait_s = _rate_limit_wait_s()
+    if wait_s > 0:
+        time.sleep(min(wait_s, 5.0))
+    _record_call()
     try:
         fyers = fyers_client()
     except Exception as exc:  # noqa: BLE001
@@ -181,16 +212,19 @@ def _poll_loop() -> None:
 
         quotes = _fetch_fyers_batch(fyers_syms, fyers_to_saint)
         _store_live_quotes(quotes)
-        time.sleep(FYERS_BATCH_INTERVAL_S)
+        sleep_s = max(FYERS_BATCH_INTERVAL_S, _rate_limit_wait_s())
+        time.sleep(sleep_s)
 
 
 def ensure_fyers_poller(symbols: list[str]) -> None:
-    """Start background batch polling for Nifty constituents (idempotent)."""
+    """Start background batch polling for index constituents (idempotent)."""
     uniq = list(dict.fromkeys(s for s in symbols if s))
     if not uniq:
         return
     with _live_lock:
-        _poller["symbols"] = uniq
+        existing = list(_poller.get("symbols") or [])
+        merged = list(dict.fromkeys([*existing, *uniq]))
+        _poller["symbols"] = merged
         if _poller.get("thread") and _poller["thread"].is_alive():
             return
         _poller["running"] = True

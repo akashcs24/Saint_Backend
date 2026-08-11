@@ -1,4 +1,4 @@
-"""5-minute PCR / Nifty board snapshot history (in-memory + light disk)."""
+"""5-minute PCR snapshot history for Nifty/Sensex (in-memory + light disk)."""
 
 from __future__ import annotations
 
@@ -11,8 +11,9 @@ from typing import Any
 from .config import settings
 
 _lock = Lock()
-_HISTORY: list[dict[str, Any]] = []
-_MAX = 48  # ~4 hours of 5m bars
+_STORE: dict[str, list[dict[str, Any]]] = {"nifty": [], "sensex": []}
+# Keep ~1 month of 5m snapshots for replay/audit (24 * 75 ~= 1800 bars).
+_MAX = 2500
 _BUCKET_S = 5 * 60
 
 
@@ -26,20 +27,28 @@ def _path() -> Path:
 
 
 def _load() -> None:
-    global _HISTORY
+    global _STORE
     path = _path()
     try:
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, list):
-                _HISTORY = data[-_MAX:]
+                _STORE = {"nifty": data[-_MAX:], "sensex": []}
+            elif isinstance(data, dict):
+                nifty_rows = data.get("nifty") if isinstance(data.get("nifty"), list) else []
+                sensex_rows = data.get("sensex") if isinstance(data.get("sensex"), list) else []
+                _STORE = {"nifty": nifty_rows[-_MAX:], "sensex": sensex_rows[-_MAX:]}
     except Exception:  # noqa: BLE001
-        _HISTORY = []
+        _STORE = {"nifty": [], "sensex": []}
 
 
 def _save() -> None:
     try:
-        _path().write_text(json.dumps(_HISTORY[-_MAX:], indent=2), encoding="utf-8")
+        payload = {
+            "nifty": _STORE.get("nifty", [])[-_MAX:],
+            "sensex": _STORE.get("sensex", [])[-_MAX:],
+        }
+        _path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
 
@@ -59,7 +68,19 @@ def _bucket_ts(now: float | None = None) -> int:
     return t - (t % _BUCKET_S)
 
 
-def record_pcr_snapshot(snap: dict[str, Any]) -> list[dict[str, Any]]:
+def _rows_for(index_key: str) -> list[dict[str, Any]]:
+    k = index_key.lower()
+    if k not in _STORE:
+        _STORE[k] = []
+    return _STORE[k]
+
+
+def record_pcr_snapshot(
+    snap: dict[str, Any],
+    *,
+    index_key: str = "nifty",
+    limit: int = 10,
+) -> list[dict[str, Any]]:
     """Upsert current 5m bucket; return newest-first history (max 10 for UI)."""
     _ensure()
     bucket = _bucket_ts()
@@ -80,20 +101,21 @@ def record_pcr_snapshot(snap: dict[str, Any]) -> list[dict[str, Any]]:
         "insight": snap.get("insight"),
     }
     with _lock:
-        if _HISTORY and int(_HISTORY[-1].get("bucketTs") or 0) == bucket:
-            prev_insight = _HISTORY[-1].get("insight")
-            _HISTORY[-1] = row
+        rows = _rows_for(index_key)
+        if rows and int(rows[-1].get("bucketTs") or 0) == bucket:
+            prev_insight = rows[-1].get("insight")
+            rows[-1] = row
             if not row.get("insight") and prev_insight:
-                _HISTORY[-1]["insight"] = prev_insight
+                rows[-1]["insight"] = prev_insight
         else:
             # insight vs previous bucket
-            if len(_HISTORY) >= 1 and not row.get("insight"):
-                row["insight"] = _delta_insight(_HISTORY[-1], row)
-            _HISTORY.append(row)
-            if len(_HISTORY) > _MAX:
-                del _HISTORY[: len(_HISTORY) - _MAX]
+            if len(rows) >= 1 and not row.get("insight"):
+                row["insight"] = _delta_insight(rows[-1], row)
+            rows.append(row)
+            if len(rows) > _MAX:
+                del rows[: len(rows) - _MAX]
         _save()
-        return list(reversed(_HISTORY[-10:]))
+        return list(reversed(rows[-max(1, int(limit)):]))
 
 
 def _delta_insight(prev: dict[str, Any], cur: dict[str, Any]) -> str:
@@ -133,7 +155,8 @@ def _delta_insight(prev: dict[str, Any], cur: dict[str, Any]) -> str:
     return "; ".join(bits) + meaning
 
 
-def pcr_history(limit: int = 10) -> list[dict[str, Any]]:
+def pcr_history(limit: int = 10, *, index_key: str = "nifty") -> list[dict[str, Any]]:
     _ensure()
     with _lock:
-        return list(reversed(_HISTORY[-limit:]))
+        rows = _rows_for(index_key)
+        return list(reversed(rows[-max(1, int(limit)):]))

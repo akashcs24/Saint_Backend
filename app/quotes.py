@@ -7,6 +7,7 @@ from typing import Any
 
 import yfinance as yf
 
+from .fyers_auth import get_access_token
 from .config import settings
 from .prices import last_close_from_cache
 from .session import effective_quote_ttl_s
@@ -101,6 +102,19 @@ def get_quote(symbol: str) -> Quote | None:
         hit = _cache.get(yahoo)
         if hit and now - hit[0] < ttl:
             return hit[1]
+
+    if get_access_token():
+        try:
+            from .fyers_quotes import live_fyers_quotes
+
+            live = live_fyers_quotes([symbol])
+            q = live.get(symbol)
+            if q is not None:
+                with _lock:
+                    _cache[yahoo] = (now, q)
+                return q
+        except Exception:  # noqa: BLE001
+            pass
 
     q = _from_yahoo(yahoo) or _from_parquet(symbol)
     if q is None:
